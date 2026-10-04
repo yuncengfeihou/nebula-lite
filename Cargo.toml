@@ -75,6 +75,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # 图片预览解码。gpui 的图像元素只吃它自己的 BGRA RenderImage，所以本地图片
 # 必须自己解码再转换（与 Pebrel doc_tabs.rs 同路数）。
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp", "ico"] }
+
+# 非 UTF-8 文本（带 BOM 的 UTF-16、以及 GB18030 / GBK / GB2312）的解码与写回。
+# 它本来就是 reqwest 的传递依赖（已在 Cargo.lock 里），所以声明成直接依赖
+# 不新增任何编译或体积成本；不引它就只能自己写 GB18030 码表，那是几百 KB 的表。
+encoding_rs = "0.8"
 # 外部改动监听。只用来盯"当前文档所在目录"这一层（非递归），见 src/watch.rs
 # 为什么盯目录而不是文件本身。
 notify = "7"

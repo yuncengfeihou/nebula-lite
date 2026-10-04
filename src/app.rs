@@ -45,6 +45,7 @@ use crate::shell;
 use crate::text_file::{self, FileKind, SaveError, TextSnapshot};
 use crate::urls;
 use crate::watch::{self, FileWatch, Signal};
+use crate::session;
 
 actions!(nebula_lite, [SaveDocument, CloseTab, NextTab, PreviousTab, IncreaseFontSize, DecreaseFontSize, ResetFontSize, OpenFolder]);
 
@@ -107,6 +108,12 @@ const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 /// 频率从"每次重绘（约 2 次/秒）"降到"每秒一次"。
 const TREE_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 会话文件的写入节流窗口。
+///
+/// 窗口拖动 / 侧栏拖动是**连续**事件，每帧写一次盘没必要（虽然文件只有几百字节）。
+/// 语义性变化（开/关标签、切根）走 `persist_session`，不等这个窗口。
+const SESSION_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub struct Workspace {
     tree: FileTree,
     /// 已打开的文档，每个标签一个，按打开顺序排列。
@@ -135,6 +142,12 @@ pub struct Workspace {
     sidebar_dragging: bool,
     /// 侧栏是否展开。点标题栏左侧的应用图标切换；收起后内容区占满整行。
     sidebar_open: bool,
+    /// 会话状态（标签 / 激活项 / 树根 / 侧栏 / 窗口）。改了就写盘，见 [`Self::persist_session`]。
+    session: session::Session,
+    /// 上一次写会话文件的时刻（连续事件走节流，见 [`SESSION_WRITE_INTERVAL`]）。
+    session_saved_at: std::time::Instant,
+    /// 窗口位置尺寸的观察订阅。必须持有：一被丢弃就不再记录窗口移动 / 缩放。
+    _window_bounds_observer: Option<Subscription>,
     /// 标题栏左上角的应用图标（`main.rs::load_app_icon` 解码好的 BGRA 图）。
     /// `None` 时那一位回落成文字标签，窗口一样能开。
     app_icon: Option<Arc<RenderImage>>,
@@ -359,6 +372,8 @@ impl Workspace {
         root: PathBuf,
         initial_file: Option<PathBuf>,
         prefer_preview: bool,
+        // 上次的会话（`None` = 第一次跑 / 会话文件坏了）。只在这里用于恢复。
+        session: Option<session::Session>,
         app_icon: Option<Arc<RenderImage>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -389,6 +404,12 @@ impl Workspace {
             &font_catalog,
             fonts::REQUIRED_FONT_FAMILY,
         );
+        // 侧栏状态：会话里有就按会话的（宽度夹回合法区间——换了显示器或缩放比之后
+        // 旧宽度可能不合理），没有就用默认值。
+        let (sidebar_open, sidebar_width) = match &session {
+            Some(saved) => (saved.sidebar_open, clamp_sidebar_width(saved.sidebar_width)),
+            None => (true, SIDEBAR_WIDTH),
+        };
         let mut workspace = Self {
             tree: FileTree::new(root),
             tabs: Vec::new(),
@@ -401,9 +422,9 @@ impl Workspace {
             tab_menu: None,
             tree_menu: None,
             renaming: None,
-            sidebar_width: SIDEBAR_WIDTH,
+            sidebar_width,
             sidebar_dragging: false,
-            sidebar_open: true,
+            sidebar_open,
             app_icon,
             font_size: DEFAULT_FONT_SIZE,
             hide_default_current_line: true,
@@ -417,6 +438,9 @@ impl Workspace {
             settings_open: false,
             font_filter,
             _font_filter_changes: None,
+            session: session.clone().unwrap_or_default(),
+            session_saved_at: std::time::Instant::now(),
+            _window_bounds_observer: None,
             font_catalog: Arc::new(font_catalog),
             ui_font: ui_font.clone(),
             editor_font: editor_font.clone(),
@@ -451,10 +475,29 @@ impl Workspace {
                     cx.notify();
                 }
             }));
-        // 支持 `nebula-lite <文件>` 直接打开该文件，与 `code <file>` 同义。
+        // 会话恢复：先把上次的标签摆回来（`restore_tabs` 已经滤掉不在磁盘上的），
+        // 再处理命令行给的文件。
+        let restored = match &session {
+            Some(saved) => workspace.restore_tabs(saved, window, cx),
+            None => false,
+        };
+        // 恢复过会话时，命令行给的**文件**走 `open_tab`：`open` 的单文件模式会把没
+        // 固定的标签全清掉（见那里的注释），那会把刚恢复出来的标签一起吃掉。
         if let Some(file) = initial_file {
-            workspace.open(file, window, cx);
+            if restored {
+                let _ = workspace.open_tab(file, window, cx);
+            } else {
+                workspace.open(file, window, cx);
+            }
         }
+        // 窗口位置与尺寸：`observe_window_bounds` 注册时会**立刻回调一次**，所以这一行
+        // 就等于"把当前窗口记下来"，之后只在窗口真的动了才回调。
+        workspace._window_bounds_observer =
+            Some(cx.observe_window_bounds(window, |this, window, cx| {
+                this.note_window_bounds(window, cx);
+            }));
+        // 收尾写一次：把"恢复到一半"的结果固化下来（已删的标签不再留在会话里）。
+        workspace.persist_session();
         workspace
     }
 
@@ -503,6 +546,7 @@ impl Workspace {
             }
         }
         self.status = Some(format!("已打开目录：{}", shell::friendly_path(&root)));
+        self.persist_session();
         cx.notify();
     }
 
@@ -588,7 +632,26 @@ impl Workspace {
                 self.active = 0;
             }
         }
+        let _ = self.open_tab(path, window, cx);
+    }
 
+    /// 把文件读进一个新标签（**不**做"单文件模式"的替换裁定），返回它在新列表里的下标。
+    ///
+    /// 与 [`Self::open`] 分成两个函数：会话恢复要把上次的多个标签一次摆回来，走 `open`
+    /// 会被"打开另一个文件就替换当前这个"那条规则吃掉（见 `open` 的注释）。`None` =
+    /// 没读进来（`open_tab` 已把原因写进状态栏）。
+    fn open_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        // 已经开着就只激活它、不新开一个：会话里可能有重复项（手改过的会话文件），
+        // 命令行给的文件也常常就是刚恢复出来的某一个。
+        if let Some(index) = self.tabs.iter().position(|doc| doc.path == path) {
+            self.activate(index, window, cx);
+            return Some(index);
+        }
         let kind = FileKind::of(&path);
         let snapshot = match text_file::load(&path) {
             Ok(snapshot) => snapshot,
@@ -597,7 +660,7 @@ impl Workspace {
                 self.error = Some(message.clone());
                 self.status = Some(message);
                 cx.notify();
-                return;
+                return None;
             },
         };
 
@@ -758,6 +821,92 @@ impl Workspace {
         self.status =
             watch_error.map(|error| format!("无法监听外部改动（{error}）：自动重载已关闭"));
         self.activate(index, window, cx);
+        Some(index)
+    }
+
+    /// 把刚落下的标签编辑成会话里记的那个样子（固定 / 预览面 / 大纲面板）。
+    fn apply_tab_state(&mut self, index: usize, tab: &session::TabState) {
+        let Some(doc) = self.tabs.get_mut(index) else {
+            return;
+        };
+        doc.pinned = tab.pinned;
+        // 预览面只对"有预览面"的类型有意义，大纲只对 Markdown 有意义——会话文件可能
+        // 被手改过，也可能来自更早的版本，这里的与运算就是那道闸。
+        doc.preview = tab.preview && doc.kind.has_preview();
+        doc.outline_open = tab.outline_open && doc.kind == FileKind::Markdown;
+    }
+
+    /// 恢复上次的会话：把标签集合摆回来。返回是否真的摆回了标签。
+    ///
+    /// 走 [`Self::open_tab`] 而不是 `open`——后者在"没有固定标签"时会替换掉当前标签
+    /// （单文件模式），一次只摆得回一个。文件已经不在了的标签由 `session::restorable`
+    /// 提前滤掉；`open_tab` 自己失败时（权限、被占用）只把原因写进状态栏，不打断启动。
+    fn restore_tabs(
+        &mut self,
+        saved: &session::Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (tabs, active) = session::restorable(saved);
+        for tab in &tabs {
+            if let Some(index) = self.open_tab(tab.path.clone(), window, cx) {
+                self.apply_tab_state(index, tab);
+            }
+        }
+        if self.tabs.is_empty() {
+            return false;
+        }
+        let target = active.min(self.tabs.len() - 1);
+        self.activate(target, window, cx);
+        true
+    }
+
+    /// 记下窗口位置 / 尺寸。窗口拖动与缩放会连续触发，所以写盘走节流。
+    fn note_window_bounds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (bounds, maximized) = match window.window_bounds() {
+            gpui::WindowBounds::Windowed(bounds) => (bounds, false),
+            gpui::WindowBounds::Maximized(bounds) => (bounds, true),
+            gpui::WindowBounds::Fullscreen(bounds) => (bounds, true),
+        };
+        self.session.window = Some(session::WindowState {
+            x: bounds.origin.x.into(),
+            y: bounds.origin.y.into(),
+            width: bounds.size.width.into(),
+            height: bounds.size.height.into(),
+            maximized,
+        });
+        let _ = cx;
+        self.persist_session_throttled();
+    }
+
+    /// 立即写一份会话文件（标签 / 激活项 / 树根 / 侧栏 / 窗口）。
+    fn persist_session(&mut self) {
+        self.session.root = Some(self.tree.root().to_path_buf());
+        self.session.tabs = self
+            .tabs
+            .iter()
+            .map(|doc| session::TabState {
+                path: doc.path.clone(),
+                pinned: doc.pinned,
+                preview: doc.preview,
+                outline_open: doc.outline_open,
+            })
+            .collect();
+        self.session.active = self.active;
+        self.session.sidebar_open = self.sidebar_open;
+        self.session.sidebar_width = self.sidebar_width;
+        self.session.save();
+        self.session_saved_at = std::time::Instant::now();
+    }
+
+    /// 有节流地写会话：窗口拖动 / 侧栏拖动这类**连续**事件走它。
+    ///
+    /// 代价是最坏晚 [`SESSION_WRITE_INTERVAL`] 落盘；语义性变化（开关标签、切根、
+    /// 切面）都直接调 [`Self::persist_session`]，不等这个窗口。
+    fn persist_session_throttled(&mut self) {
+        if self.session_saved_at.elapsed() >= SESSION_WRITE_INTERVAL {
+            self.persist_session();
+        }
     }
 
     /// 激活某个标签：更新文件树选中态、把焦点交给它的编辑器、同步窗口标题。
@@ -790,6 +939,7 @@ impl Workspace {
         // 会再确认一次）。
         self.sync_syntax_theme(cx);
         self.set_title(window);
+        self.persist_session_throttled();
         cx.notify();
     }
 
@@ -823,6 +973,7 @@ impl Workspace {
             // 沿用上一个文档的配色（虽然装上之前不渲染编辑器，但保持一致更省心）。
             self.sync_syntax_theme(cx);
             self.set_title(window);
+            self.persist_session();
             cx.notify();
             return;
         }
@@ -830,6 +981,7 @@ impl Workspace {
         // 收口：关掉之后若一个固定标签都不剩，把多余的（未固定的）标签也合掉，
         // 只留当前这个——否则它们既被关掉了显示，又还在后台监听，成了"隐形的标签"。
         self.collapse_unpinned(self.active);
+        self.persist_session();
         self.activate(self.active, window, cx);
     }
 
@@ -860,6 +1012,7 @@ impl Workspace {
         if !self.tabs.iter().any(|doc| doc.pinned) {
             self.collapse_unpinned(self.active);
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -1048,6 +1201,7 @@ impl Workspace {
     fn toggle_outline(&mut self, cx: &mut Context<Self>) {
         if let Some(doc) = self.active_doc_mut() {
             doc.outline_open = !doc.outline_open;
+            self.persist_session();
             cx.notify();
         }
     }
@@ -1358,6 +1512,7 @@ impl Workspace {
         if !preview {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -1443,6 +1598,7 @@ impl Workspace {
     /// 点标题栏图标：开合侧栏。
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
+        self.persist_session();
         cx.notify();
     }
 
@@ -1967,6 +2123,7 @@ impl Workspace {
             return;
         }
         self.sidebar_width = width;
+        self.persist_session_throttled();
         cx.notify();
     }
 
@@ -2552,12 +2709,23 @@ impl Workspace {
             body
         };
 
+        // 正文占"标签条与状态栏之间"的剩余高度：`flex_1` + `min_h_0`，不能只写 `h_full`
+        // ——`h_full` 是父容器高度的 100%，再叠上同级的标签条（36px）与状态栏（24px）
+        // 就超出了父容器，而父容器是 `overflow_hidden`，超出即被裁。
+        // 这条链上每一环都得能收缩：见下面内容列自己的 `min_h_0`。
+        let content_row = div().flex_1().min_h_0().w_full().child(content_row);
+
         // 动作反馈优先于常态提示：用户刚按下保存，最该看到的是那次操作的结果。
         let footer = self.status.clone().or_else(|| self.status_note());
 
         v_flex()
             .w(width)
             .h_full()
+            // `min_h_0`：这一列是 flex 子项、又写了 `flex_shrink_0`，不给 `min_h_0` 时它
+            // 按**内容的自动最小高度**参与布局——正文那棵树偏高一点，就能把排在最后的
+            // 状态栏顶到内容列之外（内容列 `overflow_hidden`，顶出去就等于看不见）。
+            // 与上面 `content_row` 的 `flex_1` 是一对：那条链上每一环都要能收缩。
+            .min_h_0()
             .flex_shrink_0()
             .overflow_hidden()
             .child(self.render_tabs(cx))
@@ -2579,7 +2747,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 状态栏提示：截断 / 非 UTF-8 / 只读 / 外部冲突，这些直接影响"能不能编辑"。
+/// 状态栏提示：截断 / 编码 / 只读 / 外部冲突，这些直接影响"能不能编辑"。
     fn status_note(&self) -> Option<String> {
         let doc = self.active_doc()?;
         let mut notes = Vec::new();
@@ -2593,7 +2761,10 @@ impl Workspace {
             notes.push(format!("已截断到 {} MiB", text_file::MAX_BYTES / 1024 / 1024));
         }
         if doc.snapshot.invalid_encoding {
-            notes.push(String::from("非 UTF-8 文本（按有损方式显示）"));
+            notes.push(String::from("无法识别编码（按有损方式显示）"));
+        } else if doc.snapshot.encoding != text_file::Encoding::Utf8 {
+            // 非 UTF-8 的文件要让用户知道两件事：这是什么编码、以及保存不会把它改掉。
+            notes.push(format!("编码 {}（保存按原编码写回）", doc.snapshot.encoding.label()));
         }
         if doc.snapshot.read_only && !doc.snapshot.truncated && !doc.snapshot.invalid_encoding {
             notes.push(String::from("文件系统标记为只读"));
@@ -3800,6 +3971,19 @@ fn cycle_index(active: usize, delta: isize, len: usize) -> usize {
     (active as isize + delta).rem_euclid(len as isize) as usize
 }
 
+/// 会话里存的侧栏宽度夹回合法区间；`0.0`（没存过）与 NaN 都回落默认宽度。
+///
+/// 为什么必须夹：会话文件是跨显示器、跨缩放比长期存在的，用户也可能手改它。一个
+/// 3000px 的宽度会让内容区宽度算出负数（`render` 里那一步取的是 `viewport - sidebar`），
+/// 窗口看起来就"内容区整块不见了"。
+fn clamp_sidebar_width(saved: f32) -> f32 {
+    if saved.is_finite() && saved > 0.0 {
+        saved.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+    } else {
+        SIDEBAR_WIDTH
+    }
+}
+
 /// 重算括号匹配并写进 `Document::brace_matches`。编辑器光标一动就被观察回调调用。
 ///
 /// 先做 O(1) 预检（光标处或左侧不是括号就直接判空），这样正常打字——绝大多数按键
@@ -4114,5 +4298,18 @@ mod tests {
             "Maple"
         );
         assert_eq!(resolve_font(None, &catalog, "Maple").as_ref(), "Maple");
+    }
+
+    /// 会话里存的侧栏宽度：正常值夹进 `[MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH]`，
+    /// `0` / 负数 / NaN 一律回落默认宽度（会话文件是跨显示器、跨缩放比长期存在的，
+    /// 也可能被手改）。
+    #[test]
+    fn session_sidebar_width_is_clamped_or_defaulted() {
+        assert_eq!(clamp_sidebar_width(0.0), SIDEBAR_WIDTH, "没存过 → 默认宽度");
+        assert_eq!(clamp_sidebar_width(f32::NAN), SIDEBAR_WIDTH);
+        assert_eq!(clamp_sidebar_width(-10.0), SIDEBAR_WIDTH);
+        assert_eq!(clamp_sidebar_width(200.0), 200.0);
+        assert_eq!(clamp_sidebar_width(1.0), MIN_SIDEBAR_WIDTH);
+        assert_eq!(clamp_sidebar_width(9999.0), MAX_SIDEBAR_WIDTH);
     }
 }

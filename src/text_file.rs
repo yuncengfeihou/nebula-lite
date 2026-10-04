@@ -2,9 +2,10 @@
 //!
 //! 移植自 Pebrel 的 `nebula_app/src/text_document.rs`。语义照抄，因为那套裁定
 //! 正是"像 VS Code 一样什么文件都当文本打开"的关键：
-//! - 不合法 UTF-8 或含 NUL 的字节用**有损解码**照样出字符，只是标记
-//!   `invalid_encoding` 并转只读——所以二进制文件打开看到的是乱码而不是报错，
-//!   也不会因为一次误保存把原文件写坏；
+//! - 编码按 **BOM → 严格 UTF-8 → GB18030 → 有损 UTF-8** 的顺序认：带 BOM 的
+//!   UTF-16 与 GB18030（GBK / GB2312 是它的子集）都**真解码**、并按**原编码写回**；
+//!   只有全认不出时才退到有损解码，标记 `invalid_encoding` 并转只读——所以二进制
+//!   文件打开看到的是乱码而不是报错，也不会因为一次误保存把原文件写坏；
 //! - 超过上限的内容截断显示并转只读；
 //! - BOM 与 CRLF 记录下来，保存时原样写回，不改动用户文件的既有约定。
 
@@ -12,14 +13,47 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use encoding_rs::{GB18030, UTF_16BE, UTF_16LE};
+
 /// 一次性读入的上限。超过就截断（行级虚拟化只解决渲染成本，解码与塑形仍随
 /// 内容量增长）。
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// UTF-8 的 BOM。UTF-16 的 BOM 由 `Encoding` 决定，不用这个常量。
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// 支持识别 / 写回的文本编码。
+///
+/// 为什么是这四个：UTF-8 是默认；UTF-16 **只认带 BOM 的**（没有 BOM 的 UTF-16 与
+/// "半个 GB18030"在字节层分不开，硬猜会两边都错）；GB18030 是中文老文本的落点
+/// （GBK / GB2312 都是它的子集，同一张表就能覆盖）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Gb18030,
+}
+
+impl Encoding {
+    /// 状态栏里显示的名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16Le => "UTF-16 LE",
+            Self::Utf16Be => "UTF-16 BE",
+            Self::Gb18030 => "GB18030",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TextSnapshot {
     pub text: String,
     pub bytes: Arc<[u8]>,
+    /// 这份文件的编码：读盘时按它解码，保存时按它写回。
+    pub encoding: Encoding,
+    /// UTF-8 的 BOM 标记（UTF-16 的 BOM 由 `encoding` 表达）。
     pub bom: bool,
     pub crlf: bool,
     pub truncated: bool,
@@ -77,20 +111,19 @@ impl TextSnapshot {
     pub fn decode(mut bytes: Vec<u8>, read_only: bool) -> Self {
         let truncated = bytes.len() > MAX_BYTES;
         bytes.truncate(MAX_BYTES);
-        let bom = bytes.starts_with(b"\xef\xbb\xbf");
-        let body = if bom { &bytes[3..] } else { &bytes };
-        let invalid_encoding = std::str::from_utf8(body).is_err() || body.contains(&0);
-        let text = String::from_utf8_lossy(body);
+        let Decoded { encoding, bom, text, invalid } = decode_text(&bytes);
+        // 整篇的换行都是 CRLF 才算 CRLF（混用时保持原样，免得把 LF 也改掉）。
         let crlf = text.contains("\r\n") && !text.replace("\r\n", "").contains('\n');
         let text = text.replace("\r\n", "\n");
         Self {
             text,
             bytes: bytes.into(),
+            encoding,
             bom,
             crlf,
             truncated,
-            invalid_encoding,
-            read_only: read_only || truncated || invalid_encoding,
+            invalid_encoding: invalid,
+            read_only: read_only || truncated || invalid,
         }
     }
 
@@ -99,9 +132,50 @@ impl TextSnapshot {
         if self.read_only {
             return Err(SaveError::ReadOnly);
         }
-        let mut bytes = if self.bom { b"\xef\xbb\xbf".to_vec() } else { Vec::new() };
-        let encoded = if self.crlf { text.replace('\n', "\r\n") } else { text.to_owned() };
-        bytes.extend_from_slice(encoded.as_bytes());
+        // 换行风格按原文件还原（`crlf` 只在整篇都是 CRLF 时才为真）。
+        let body = if self.crlf { text.replace('\n', "\r\n") } else { text.to_owned() };
+        let mut bytes = Vec::new();
+        match self.encoding {
+            Encoding::Utf8 => {
+                if self.bom {
+                    bytes.extend_from_slice(UTF8_BOM);
+                }
+                bytes.extend_from_slice(body.as_bytes());
+            }
+            // UTF-16 的编码**不**交给 encoding_rs：它按 WHATWG 的"输出编码"概念把
+            // UTF-16 归一成 UTF-8（`Encoding::output_encoding()`），`new_encoder()`
+            // 因此编不出 UTF-16 字节。标准库的 `encode_utf16()` 本来就够（代理对也对）。
+            Encoding::Utf16Le => {
+                bytes.extend_from_slice(&[0xFF, 0xFE]);
+                for unit in body.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+            }
+            Encoding::Utf16Be => {
+                bytes.extend_from_slice(&[0xFE, 0xFF]);
+                for unit in body.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_be_bytes());
+                }
+            }
+            Encoding::Gb18030 => {
+                let (encoded, _, had_errors) = GB18030.encode(&body);
+                if had_errors {
+                    // 通用守则：encoding_rs 会把表示不了的字符写成 `&#NNNN;` 这类数字引用
+                    // （WHATWG 的规定），对编辑器来说那是**静默改内容**：保存之后文件里
+                    // 就多了字面量。所以这里报错，由用户决定换编码还是改文字。
+                    //
+                    // GB18030 覆盖全部 Unicode（`gb18030_can_represent_every_character_
+                    // including_emoji` 钉住了这一点），所以这条分支实际走不到；留着是因为
+                    // 它是这一层的**通用**约定——以后再加别的编码时不用重新想一遍。
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "文本含该编码无法表示的字符，保存会改写内容",
+                    )
+                    .into());
+                }
+                bytes.extend_from_slice(&encoded);
+            }
+        }
         if bytes.len() > MAX_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -125,6 +199,94 @@ impl TextSnapshot {
         self.bytes = self.encode(text)?.into();
         Ok(())
     }
+}
+
+/// 一次解码的结果。
+struct Decoded {
+    encoding: Encoding,
+    bom: bool,
+    text: String,
+    /// true = 所有编码都认不出，按有损 UTF-8 显示（二进制文件那条路）。
+    invalid: bool,
+}
+
+/// 按"BOM → 严格 UTF-8 → GB18030 → 有损 UTF-8"的顺序认编码。
+///
+/// 顺序有讲究：UTF-16 只认带 BOM 的；严格 UTF-8 优先于 GB18030——UTF-8 的多字节
+/// 序列有校验位，能整体通过的字节流几乎不可能是 GB18030 文本；最后才退到"有损显示
+/// 并转只读"，也就是二进制文件那条路。
+fn decode_text(bytes: &[u8]) -> Decoded {
+    if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let (text, _) = UTF_16LE.decode_without_bom_handling(body);
+        return Decoded {
+            encoding: Encoding::Utf16Le,
+            bom: true,
+            text: text.into_owned(),
+            invalid: false,
+        };
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let (text, _) = UTF_16BE.decode_without_bom_handling(body);
+        return Decoded {
+            encoding: Encoding::Utf16Be,
+            bom: true,
+            text: text.into_owned(),
+            invalid: false,
+        };
+    }
+    let (bom, body) = match bytes.strip_prefix(UTF8_BOM) {
+        Some(body) => (true, body),
+        None => (false, bytes),
+    };
+    if let Ok(text) = std::str::from_utf8(body)
+        && !body.contains(&0)
+    {
+        return Decoded {
+            encoding: Encoding::Utf8,
+            bom,
+            text: text.to_owned(),
+            invalid: false,
+        };
+    }
+    if let Some(text) = decode_gb18030(body) {
+        return Decoded { encoding: Encoding::Gb18030, bom: false, text, invalid: false };
+    }
+    Decoded {
+        encoding: Encoding::Utf8,
+        bom,
+        text: String::from_utf8_lossy(body).into_owned(),
+        invalid: true,
+    }
+}
+
+/// 试按 GB18030 解码；解不出"像文本"的结果就返回 `None`（那多半是二进制）。
+///
+/// GB18030 几乎把每个字节对都映射到某个字符，所以"解得出"本身不构成证据——压缩
+/// 数据也能解成一坨汉字。两道附加判据：
+/// 1. **不含 NUL**：文本文件不会有，二进制里到处都是；
+/// 2. 解码**无错**，且控制字符（`\t \n \r \f \v` 除外）与替换字符 `U+FFFD` 的
+///    占比 **< 1%**。
+fn decode_gb18030(bytes: &[u8]) -> Option<String> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    let (text, had_errors) = GB18030.decode_without_bom_handling(bytes);
+    if had_errors {
+        return None;
+    }
+    let mut unusual = 0usize;
+    let mut total = 0usize;
+    for ch in text.chars() {
+        total += 1;
+        if matches!(ch, '\t' | '\n' | '\r' | '\u{c}' | '\u{b}') {
+            continue;
+        }
+        if ch == '\u{fffd}' || ch.is_control() {
+            unusual += 1;
+        }
+    }
+    // 用整数比较代替浮点：不足 1% 就算文本。
+    (unusual * 100 < total).then(|| text.into_owned())
 }
 
 /// 读盘并解码。只读判定只看文件系统属性，解码层的只读另行叠加。
@@ -256,6 +418,90 @@ mod tests {
         assert!(matches!(snapshot.verify(b"other"), Err(SaveError::Changed)));
     }
 
+    /// UTF-16 LE（带 BOM）：解码出中文，并**按原编码**写回（字节级相等）。
+    #[test]
+    fn utf16_le_with_bom_decodes_and_round_trips() {
+        let text = "第一行\nsecond\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let snapshot = TextSnapshot::decode(bytes.clone(), false);
+        assert_eq!(snapshot.encoding, Encoding::Utf16Le);
+        assert_eq!(snapshot.text, text);
+        assert!(!snapshot.invalid_encoding && !snapshot.read_only, "UTF-16 不是有损回落");
+        assert_eq!(snapshot.encode(&snapshot.text).unwrap(), bytes);
+    }
+
+    /// UTF-16 BE：BOM 是 FE FF，字节序跟着换。
+    #[test]
+    fn utf16_be_with_bom_round_trips() {
+        let text = "alpha\n贝塔\n";
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        let snapshot = TextSnapshot::decode(bytes.clone(), false);
+        assert_eq!(snapshot.encoding, Encoding::Utf16Be);
+        assert_eq!(snapshot.text, text);
+        assert_eq!(snapshot.encode(&snapshot.text).unwrap(), bytes);
+    }
+
+    /// GB18030（GBK / GB2312 是它的子集）：解码出中文、**可编辑**、按原编码写回。
+    #[test]
+    fn gb18030_text_is_decoded_and_editable() {
+        let original = "中文标题\r\n第二行内容\r\n";
+        let (bytes, _, had_errors) = encoding_rs::GB18030.encode(original);
+        assert!(!had_errors);
+        let snapshot = TextSnapshot::decode(bytes.to_vec(), false);
+        assert_eq!(snapshot.encoding, Encoding::Gb18030);
+        assert_eq!(snapshot.text, "中文标题\n第二行内容\n");
+        assert!(snapshot.crlf, "CRLF 按原样还原");
+        assert!(!snapshot.invalid_encoding && !snapshot.read_only, "GB18030 是可编辑文本");
+        // 原样写回字节级相等；改一行之后只有那一行变（换行仍是 CRLF、编码仍是 GB18030）。
+        assert_eq!(snapshot.encode(&snapshot.text).unwrap(), bytes.to_vec());
+        let (expected, _, _) = encoding_rs::GB18030.encode("中文标题\r\n改过的内容\r\n");
+        assert_eq!(snapshot.encode("中文标题\n改过的内容\n").unwrap(), expected.to_vec());
+    }
+
+    /// GB18030 能表示**全部 Unicode**（4 字节序列段覆盖 BMP 之外的码位），所以 emoji
+    /// 也能原样写回。值得钉住：`encode` 里那条"表示不了就报错"的分支正是为**别的**编码
+    /// 准备的（encoding_rs 对真表示不了的字符会改写成 `&#NNNN;` 数字引用，那等于静默
+    /// 改内容），GB18030 走不到它——是运气，不是假设。
+    #[test]
+    fn gb18030_can_represent_every_character_including_emoji() {
+        let original = "中文 🙂\n";
+        let (bytes, _, had_errors) = encoding_rs::GB18030.encode(original);
+        assert!(!had_errors, "GB18030 覆盖全部 Unicode，不该出现表示不了的字符");
+        let snapshot = TextSnapshot::decode(bytes.to_vec(), false);
+        assert_eq!(snapshot.encoding, Encoding::Gb18030);
+        assert_eq!(snapshot.text, original);
+        assert_eq!(snapshot.encode(&snapshot.text).unwrap(), bytes.to_vec());
+    }
+
+    /// 二进制不能被 GB18030 那条路"救活"，仍然是有损 + 只读。
+    ///
+    /// 三个样本各有各的用处：高字节垃圾靠"解码有错"挡掉，带 NUL 的靠"含 NUL"挡掉，
+    /// 而**真实文件**（仓库里的应用图标）是最有说服力的那个——它同时含高字节、NUL 与
+    /// 大量控制字节。注意纯 ASCII 的控制字节（`PK\x03\x04` 这种压缩包头）**不会**被
+    /// 这层拦下：它们是合法 UTF-8，走的是老早就有的"合法 UTF-8 即文本"那条路。
+    #[test]
+    fn binary_bytes_are_not_mistaken_for_gb18030() {
+        // 0xFF 不是合法的 GB18030 首字节：解码有错 → 不认。
+        let snapshot = TextSnapshot::decode(vec![0xFF; 64], false);
+        assert!(snapshot.invalid_encoding && snapshot.read_only);
+        // 真实二进制：内嵌的应用图标（ICO）。
+        let icon = include_bytes!("../windows/nebula-lite.ico").to_vec();
+        let snapshot = TextSnapshot::decode(icon, false);
+        assert!(snapshot.invalid_encoding, "ICO 不该被认成文本");
+        assert!(snapshot.read_only);
+        // 带 NUL 的字节流：NUL 直接判二进制（老规矩，没动过）。
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(std::iter::repeat_n(0u8, 32));
+        let snapshot = TextSnapshot::decode(png, false);
+        assert!(snapshot.invalid_encoding && snapshot.read_only);
+    }
+
     /// 冲突之后用户得有出路：显式的覆盖保存能写过去，而普通保存照旧拒绝。
     /// 两条路都要有，否则冲突提示会变成死胡同。
     #[test]
@@ -273,6 +519,54 @@ mod tests {
 
         save_over(&path, &snapshot, "mine").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"mine");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 走真实文件系统的整条路：GB18030 的老文本读进来是**可编辑的中文**，改一行保存
+    /// 回去仍然按 GB18030 写（不会被偷偷改成 UTF-8），CRLF 也原样保留。
+    #[test]
+    fn gb18030_file_loads_editable_and_saves_back_in_gb18030() {
+        let dir = std::env::temp_dir().join(format!("nebula-lite-gb18030-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.txt");
+        let (original, _, _) = encoding_rs::GB18030.encode("第一行\r\n第二行\r\n");
+        std::fs::write(&path, original.to_vec()).unwrap();
+
+        let snapshot = load(&path).unwrap();
+        assert_eq!(snapshot.encoding, Encoding::Gb18030);
+        assert!(!snapshot.invalid_encoding && !snapshot.read_only, "GB18030 文本可编辑");
+        assert_eq!(snapshot.text, "第一行\n第二行\n");
+        assert!(snapshot.crlf);
+
+        save(&path, &snapshot, "第一行\n改过的第二行\n").unwrap();
+        let (expected, _, _) = encoding_rs::GB18030.encode("第一行\r\n改过的第二行\r\n");
+        assert_eq!(std::fs::read(&path).unwrap(), expected.to_vec());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UTF-16 LE 同理：可编辑、存回去仍是 UTF-16（BOM 与 CRLF 都在）。
+    #[test]
+    fn utf16_file_loads_editable_and_saves_back_as_utf16() {
+        let dir = std::env::temp_dir().join(format!("nebula-lite-utf16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("utf16.txt");
+        let mut original = vec![0xFF, 0xFE];
+        for unit in "甲\r\n乙\r\n".encode_utf16() {
+            original.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &original).unwrap();
+
+        let snapshot = load(&path).unwrap();
+        assert_eq!(snapshot.encoding, Encoding::Utf16Le);
+        assert!(!snapshot.read_only);
+        assert_eq!(snapshot.text, "甲\n乙\n");
+
+        save(&path, &snapshot, "甲\n乙\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

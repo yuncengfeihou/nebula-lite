@@ -18,6 +18,7 @@ mod lang;
 mod languages;
 mod np3;
 mod outline;
+mod session;
 mod settings;
 mod shell;
 mod syntax;
@@ -29,13 +30,30 @@ mod watch;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Bounds, KeyBinding, RenderImage, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext as _, Bounds, KeyBinding, Pixels, RenderImage, Size, WindowBounds,
+    WindowOptions, point, px, size,
+};
 use gpui_component::{Root, TitleBar};
 use image::Frame;
 
 fn main() {
     // 没有参数时打开当前目录；传目录则打开它，传文件则打开该文件并在树里展开。
-    let Launch { root, file, prefer_preview } = resolve_target();
+    let Launch { root: cli_root, file, prefer_preview, explicit } = resolve_target();
+    // 会话：上次的标签 / 树根 / 侧栏 / 窗口位置。`None` = 第一次跑，或者会话文件坏了
+    // ——那两种情况都完全按命令行参数启动（见 `session::Session::load`）。
+    let session = session::Session::load();
+    // 树根：命令行给了就用它（`启动 nebula-lite.cmd` 总会给一个目录），否则用上次的
+    // （还得真的还是个目录），都没有才回落命令行算出来的那个（即当前工作目录）。
+    let root = if explicit {
+        cli_root
+    } else {
+        session
+            .as_ref()
+            .and_then(|saved| saved.root.clone())
+            .filter(|path| path.is_dir())
+            .unwrap_or(cli_root)
+    };
 
     gpui_platform::application()
         .with_assets(gpui_component_assets::Assets)
@@ -77,28 +95,33 @@ fn main() {
                 KeyBinding::new("ctrl-shift-o", app::OpenFolder, None),
             ]);
 
-            // 窗口尺寸必须夹进显示器的可用区，不能无条件用 1280x820：高缩放比
-            // （本机 125%）下逻辑尺寸换算成物理像素后可能超过物理屏，窗口右侧
-            // 会被推到屏幕外——头部右上角的「源码/预览」按钮就永远点不到。
-            let preferred = size(px(1280.), px(820.));
-            let window_size = match cx.primary_display() {
-                Some(display) => {
-                    let available = display.visible_bounds().size;
-                    size(
-                        preferred.width.min(available.width - px(96.)).max(px(720.)),
-                        preferred.height.min(available.height - px(96.)).max(px(480.)),
-                    )
-                },
-                None => preferred,
+            // 窗口位置与尺寸：优先用上次那份（会话里），不可信或那块屏幕不在了就回落
+            // 居中。尺寸的夹取与"位置还算不算在屏幕上"的判定都在 `resolve_window` /
+            // `default_window_size` 里，两个都是纯函数、有单测。
+            let display = cx.primary_display();
+            let available = display.as_ref().map(|display| display.visible_bounds());
+            let (bounds, maximized) =
+                match resolve_window(session.as_ref().and_then(|saved| saved.window), available) {
+                    Some((origin, size, maximized)) => (Bounds { origin, size }, maximized),
+                    None => {
+                        let size = default_window_size(available.map(|area| area.size));
+                        (Bounds::centered(None, size, cx), false)
+                    }
+                };
+            let window_bounds = if maximized {
+                WindowBounds::Maximized(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
             };
-            let bounds = Bounds::centered(None, window_size, cx);
             let root = root.clone();
             let file = file.clone();
+            // 会话要 move 进下面的窗口闭包，这里给内层留一份。
+            let session = session.clone();
             // 应用图标解码一次：标题栏左上角要显示它（点它开合侧栏），见 `app.rs`。
             let app_icon = load_app_icon();
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(window_bounds),
                     titlebar: Some(TitleBar::title_bar_options()),
                     app_id: Some("nebula-lite".to_owned()),
                     ..Default::default()
@@ -118,6 +141,7 @@ fn main() {
                             root.clone(),
                             file.clone(),
                             prefer_preview,
+                            session,
                             app_icon,
                             window,
                             cx,
@@ -164,6 +188,11 @@ struct Launch {
     file: Option<PathBuf>,
     /// `--preview`：有预览面的文件以预览打开。
     prefer_preview: bool,
+    /// 命令行是否**显式**给了位置参数。
+    ///
+    /// 用来决定"树根听谁的"：显式给了就听命令行的（启动器总会给一个目录），否则听
+    /// 会话里上次那个。标签恢复不受这个影响——两种情况都会恢复。
+    explicit: bool,
 }
 
 /// 决定文件树根与启动时要打开的文件：命令行位置参数优先，否则用当前工作目录。
@@ -180,12 +209,14 @@ fn resolve_target() -> Launch {
         }
     }
 
+    let explicit = positional.is_some();
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (candidate, file) = split_target(positional, cwd);
     // 绝对化，避免文件树里出现相对路径拼出来的怪名字。
     let root = std::fs::canonicalize(&candidate).unwrap_or(candidate);
     let file = file.map(|path| std::fs::canonicalize(&path).unwrap_or(path));
-    Launch { root, file, prefer_preview }
+    Launch { root, file, prefer_preview, explicit }
 }
 
 /// 把位置参数拆成「树根 + 要打开的文件」。
@@ -206,6 +237,54 @@ fn parent_or_current(path: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => cwd.to_path_buf(),
     }
+}
+
+/// 默认窗口尺寸：1280×820 夹进显示器可用区。
+///
+/// 不能无条件用 1280×820：高缩放比（本机 125%）下逻辑尺寸换算成物理像素后可能超过
+/// 物理屏，窗口右侧会被推到屏幕外——头部右上角的「源码/预览」按钮就永远点不到。
+fn default_window_size(available: Option<Size<Pixels>>) -> Size<Pixels> {
+    let preferred = size(px(1280.), px(820.));
+    match available {
+        Some(area) => size(
+            preferred.width.min(area.width - px(96.)).max(px(720.)),
+            preferred.height.min(area.height - px(96.)).max(px(480.)),
+        ),
+        None => preferred,
+    }
+}
+
+/// 由上次的窗口矩形算出这次的窗口位置与尺寸；`None` = 用默认的居中窗口。
+///
+/// 两种情况要把**位置**丢掉、回到居中：
+/// 1. 存下来的尺寸不像个真窗口（手改 / 损坏的会话文件，见 `WindowState::is_plausible`）；
+/// 2. 那块区域已经不在当前显示器的可用区里——拔掉外接屏之后最常见。
+///
+/// 尺寸无论如何都会夹进可用区：换了缩放比或分辨率之后，旧尺寸可能整块超出屏幕。
+fn resolve_window(
+    saved: Option<session::WindowState>,
+    available: Option<Bounds<Pixels>>,
+) -> Option<(gpui::Point<Pixels>, Size<Pixels>, bool)> {
+    let saved = saved?;
+    if !saved.is_plausible() {
+        return None;
+    }
+    let mut window_size = size(px(saved.width), px(saved.height));
+    if let Some(area) = available {
+        window_size = size(
+            window_size.width.min(area.size.width - px(96.)).max(px(720.)),
+            window_size.height.min(area.size.height - px(96.)).max(px(480.)),
+        );
+    }
+    let rect = Bounds { origin: point(px(saved.x), px(saved.y)), size: window_size };
+    if let Some(area) = available {
+        // 至少要露出一块抓得住的标题栏（80×40），否则用户拖不回来。
+        let visible = rect.intersect(&area);
+        if visible.size.width < px(80.) || visible.size.height < px(40.) {
+            return None;
+        }
+    }
+    Some((rect.origin, rect.size, saved.maximized))
 }
 
 #[cfg(test)]
@@ -259,5 +338,53 @@ mod tests {
         let (root, file) = split_target(Some(PathBuf::from("C:/work")), PathBuf::from("C:/other"));
         assert_eq!(root, PathBuf::from("C:/work"));
         assert_eq!(file, None);
+    }
+
+    /// 会话里存的窗口矩形：能用就用、越界就夹、不可信就丢掉（回落居中）。
+    #[test]
+    fn saved_window_bounds_are_restored_clamped_or_dropped() {
+        let area = Bounds { origin: point(px(0.), px(0.)), size: size(px(1920.), px(1080.)) };
+
+        // 正常存过：位置与尺寸照用（最大化标志也带回来）。
+        let saved = session::WindowState {
+            x: 120.0,
+            y: 60.0,
+            width: 1000.0,
+            height: 700.0,
+            maximized: false,
+        };
+        let (origin, window_size, maximized) = resolve_window(Some(saved), Some(area)).unwrap();
+        assert_eq!((origin.x, origin.y), (px(120.), px(60.)));
+        assert_eq!((window_size.width, window_size.height), (px(1000.), px(700.)));
+        assert!(!maximized);
+
+        // 尺寸超出可用区：夹到"可用区 - 96px"。
+        let saved = session::WindowState {
+            x: 0.0,
+            y: 0.0,
+            width: 5000.0,
+            height: 4000.0,
+            maximized: true,
+        };
+        let (_, window_size, maximized) = resolve_window(Some(saved), Some(area)).unwrap();
+        assert_eq!((window_size.width, window_size.height), (px(1824.), px(984.)));
+        assert!(maximized);
+
+        // 位置整块在屏幕外（拔掉外接屏）：连位置一起丢掉，调用侧会居中打开。
+        let saved = session::WindowState {
+            x: -5000.0,
+            y: -5000.0,
+            width: 1000.0,
+            height: 700.0,
+            maximized: false,
+        };
+        assert!(resolve_window(Some(saved), Some(area)).is_none());
+
+        // 尺寸不可信（0×0）：丢掉。
+        let saved = session::WindowState { x: 10.0, y: 10.0, width: 0.0, height: 0.0, maximized: false };
+        assert!(resolve_window(Some(saved), Some(area)).is_none());
+
+        // 没存过：也走居中那条路。
+        assert!(resolve_window(None, Some(area)).is_none());
     }
 }

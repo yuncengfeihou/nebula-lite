@@ -3858,6 +3858,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "embed-resource",
+ "encoding_rs",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
