@@ -50,6 +50,27 @@ impl std::fmt::Display for SaveError {
     }
 }
 
+/// 编辑缓冲（rope）与磁盘基线是否**逐字节相同**。
+///
+/// 这是"未保存标记"的判据。从前调用侧写的是 `value() != snapshot.text`，而 `value()`
+/// 每次都会把整条 rope 拷成一份新 String（2 MiB 时实测 1.14 ms，且随文件线性增长）。
+/// 改成按块比对之后：调用侧先比长度——插入 / 删除是最常见的编辑，长度一变就有结论，
+/// 那是 O(1)；只有"等长改写"才走到这里逐块 memcmp。
+///
+/// 参数是**块迭代器**（`Rope::chunks()`）而不是 rope 本身：这一层不必为此多一个 ropey
+/// 直接依赖，也就不会踩到"同名 crate 解析成两套不兼容类型"那个坑（见 Cargo.toml 顶部）。
+pub fn same_text<'a>(chunks: impl Iterator<Item = &'a str>, baseline: &str) -> bool {
+    let mut rest = baseline.as_bytes();
+    for chunk in chunks {
+        let bytes = chunk.as_bytes();
+        if !rest.starts_with(bytes) {
+            return false;
+        }
+        rest = &rest[bytes.len()..];
+    }
+    rest.is_empty()
+}
+
 impl std::error::Error for SaveError {}
 
 impl TextSnapshot {
@@ -290,5 +311,17 @@ mod tests {
         assert!(FileKind::Image.has_preview());
         // 普通文件没有预览面，只有编辑器。
         assert!(!FileKind::Text.has_preview());
+    }
+
+    #[test]
+    fn same_text_compares_chunk_wise_against_the_baseline() {
+        // 缓冲侧给的是"按块"的切片（`Rope::chunks()` 的形状），基线是一整条 &str。
+        assert!(same_text(["hello", " world"].into_iter(), "hello world"));
+        assert!(same_text(["hello world"].into_iter(), "hello world"));
+        assert!(same_text(std::iter::empty(), ""), "空缓冲 + 空基线 = 相同");
+        assert!(!same_text(["hello", " world"].into_iter(), "hello worlD"));
+        assert!(!same_text(["hello"].into_iter(), "hello world"), "短了不算相同");
+        assert!(!same_text(["hello world!"].into_iter(), "hello world"), "长了也不算");
+        assert!(!same_text(std::iter::empty(), "x"));
     }
 }

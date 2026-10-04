@@ -282,6 +282,26 @@ struct Document {
     conflict: bool,
     /// 文件已从磁盘上消失（外部删除或改名）。缓冲原样留着，保存可以把它写回来。
     missing: bool,
+    /// Markdown 大纲（ATX 标题表）。
+    ///
+    /// **缓存**，不每帧现算：`outline::headings` 要过一遍整篇文本，而渲染路径里动作区
+    /// （"大纲"药丸是否出现）与内容区各读一次——2 MiB 的 Markdown 每帧这两处就白烧
+    /// 4.9 ms（`InputState::value()` 每次调用还会把整条 rope 拷成一份新 String）。
+    /// 刷新点只有 `refresh_derived_layers` 一处：打开、缓冲变更、外部重载。
+    headings: Vec<outline::Heading>,
+    /// 派生层（热点 / 补充层 / 大纲）欠着一次重算，已经排了防抖任务。
+    ///
+    /// 只对"大文档"用：小文档每次改动立刻重算，观感与从前完全一样；大文档把那几层
+    /// 全缓冲扫描推迟到停手之后合并做一次。见 `DERIVED_DEBOUNCE`。
+    derived_pending: bool,
+    /// 缓冲内容版本号：**任何**内容变化都加一（用户的编辑走 `InputEvent::Change`，
+    /// 程序化换内容走 `refresh_derived_layers`）。
+    ///
+    /// 两处用它：
+    /// - 防抖任务判断"这一轮等待期间又改过没有"——改过就再等一轮，于是派生层重算只
+    ///   发生在真正停手之后，而不是每 [`DERIVED_DEBOUNCE`] 都算一次；
+    /// - 括号高亮把它与光标位置合起来当记忆钥匙（见 `refresh_brace_marks`）。
+    text_rev: u64,
     /// 输入事件订阅。必须持有：`Subscription` 一被丢弃就退订。
     _changes: Subscription,
     /// 外部改动监听。必须持有：一被丢弃就停止监听，重载任务也随之结束。
@@ -289,6 +309,12 @@ struct Document {
     /// 当前匹配到的两个括号的字节区间（`None` = 光标不在括号上）。
     /// 在光标移动时由 `refresh_brace_marks` 重算；渲染时按它自绘圆角框。
     brace_matches: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    /// `brace_matches` 是按 `(text_rev, 光标字节位置)` 算出来的——这就是那把钥匙。
+    ///
+    /// 编辑器每 notify 一次（光标移动、内容变化，**以及我们自己那两层装饰 `set`**，
+    /// 它们内部都会 `cx.notify()`）都会走 `refresh_brace_marks`；而匹配结果只由"内容 +
+    /// 光标"决定，钥匙没变就该直接复用（从前每次重算一遍全文扫描）。
+    brace_key: Option<(u64, usize)>,
     /// 光标移动的观察订阅。必须持有：一被丢弃括号高亮就不再更新。
     _brace_observer: Subscription,
     /// 裸 URL 的高亮装饰层（Notepad3 的 "Hyperlink Hotspots"）。
@@ -407,10 +433,14 @@ impl Workspace {
             theme.font_family = ui_font;
             theme.mono_font_family = editor_font;
         }
-        // 过滤词一变就只重渲染：树的展平在 `render_sidebar` 里现算，不需要缓存。
+        // 过滤词一变：行缓存作废（不然树还停在旧筛选结果上）+ 重渲染。
+        //
+        // 事件驱动之后 `sync_rows` 就不必**每帧**去读一次过滤框（那次读会走
+        // `InputState::value()`，即一次 rope → String 拷贝）——只在真正要重新展平时才读。
         workspace._filter_changes =
-            Some(cx.subscribe_in(&workspace.filter, window, |_, _, event, _, cx| {
+            Some(cx.subscribe_in(&workspace.filter, window, |this, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.invalidate_tree();
                     cx.notify();
                 }
             }));
@@ -508,16 +538,18 @@ impl Workspace {
 
     /// 需要时重建行缓存，并返回当前应为可见的行。
     ///
-    /// 三种情况会重新展平：过滤词变了、树版本变了（展开/收起、外部改动事件），
-    /// 或者缓存已经超过 [`TREE_REFRESH`] 那么旧。后者是"文件树跟着外部变化刷新"
-    /// 那条既有行为的落脚点——展平要同步读盘，原实现每帧都做，这里把它节流到
-    /// 每秒一次；重绘本身仍然照旧（光标闪烁约每秒两次）。
+    /// 三种情况会重新展平：过滤词变了（过滤框的订阅会作废缓存）、树版本变了
+    /// （展开/收起、外部改动事件），或者缓存已经超过 [`TREE_REFRESH`] 那么旧。后者是
+    /// "文件树跟着外部变化刷新"那条既有行为的落脚点——展平要同步读盘，原实现每帧都做，
+    /// 这里把它节流到每秒一次；重绘本身仍然照旧（光标闪烁约每秒两次）。
     fn sync_rows(&mut self, cx: &gpui::App) {
-        let query = self.filter_query(cx);
         let stale = self.rows_at.elapsed() >= TREE_REFRESH;
-        if self.rows_rev == self.tree_rev && self.rows_query == query && !stale {
+        if self.rows_rev == self.tree_rev && !stale {
             return;
         }
+        // 过滤词只在真要重展平时才读（过滤框有自己的订阅在改它时作废缓存，
+        // 见 `Workspace::new` 里的 `_filter_changes`）。
+        let query = self.filter_query(cx);
         self.rows = self.tree.rows_filtered(&query);
         self.rows_query = query;
         self.rows_rev = self.tree_rev;
@@ -581,22 +613,14 @@ impl Workspace {
         });
         input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
 
-        // 裸 URL 高亮（Notepad3 的 "Hyperlink Hotspots"）：按它的正则扫一遍缓冲，
-        // 把命中区间作为独立装饰层交给编辑器。装饰在组件库里是**在语法样式之后**
-        // 合成的，所以能盖过词法色（例如 Markdown 链接里那段 URL 的绿色）。
-        let hotspots = input.update(cx, |state, cx| {
-            state.create_decorations_collection(hotspot_decorations(&state.value()), cx)
-        });
-
-        // Notepad3 补充层：批处理的前景逐词判色 + 代码 / 变量 / 标签 / 标题等底色。
-        // 前景走装饰集合，底色走 `render_source` 下方那张 canvas。见 `np3` 模块。
-        let Overlay { foreground: np3_foreground, backgrounds: np3_backgrounds } =
-            compute_overlay(language, &text);
-        let has_backgrounds = np3_backgrounds.iter().any(|span| span.ink.bg.is_some());
-        let overlay = input.update(cx, |state, cx| {
-            state.create_decorations_collection(np3_foreground, cx)
-        });
-        let backgrounds = Rc::new(RefCell::new(np3_backgrounds));
+        // 两层装饰集合（裸 URL 热点、补充层前景）先建成空的：内容随后由
+        // `refresh_derived_layers` 一次填好——打开 / 改动 / 外部重载共用一条路径，
+        // 逻辑只有一份。
+        let hotspots = input
+            .update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
+        let overlay = input
+            .update(cx, |state, cx| state.create_decorations_collection(Vec::new(), cx));
+        let backgrounds = Rc::new(RefCell::new(Vec::new()));
 
         let image = if kind == FileKind::Image { decode_image(&path).ok() } else { None };
         // 尺寸来自解码结果，供缩放/平移的基准比例用；非图片留 `None`。
@@ -611,24 +635,68 @@ impl Workspace {
         // 载入内容的变化事件就会漏掉。事件按**输入实体**回找标签：标签下标会随
         // 关闭而移动、路径会在重命名时变，只有 `input` 实体是全程稳定的身份。
         let changed_input = input.clone();
-        let changes = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
+        let changes = cx.subscribe_in(&input, window, move |this, _, event, window, cx| {
             if matches!(event, InputEvent::Change) {
                 let changed_input = changed_input.clone();
                 if let Some(doc) = this.tabs.iter_mut().find(|doc| doc.input == changed_input) {
-                    let value = doc.input.read(cx).value();
-                    doc.dirty = value.as_ref() != doc.snapshot.text.as_str();
+                    // 脏判定**不拷缓冲**：先比长度（插入 / 删除是最常见的编辑，长度一变
+                    // 就有结论），长度相同时才逐块比对 rope 与磁盘基线。从前这里每次都
+                    // `value()`——全量 rope→String 拷贝，2 MiB 时 1.14 ms。
+                    doc.dirty = {
+                        let state = doc.input.read(cx);
+                        let rope = state.text();
+                        rope.len() != doc.snapshot.text.len()
+                            || !text_file::same_text(rope.chunks(), &doc.snapshot.text)
+                    };
                     // 一旦开始打字，说明用户已经在编辑器里操作了——点亮当前行。
                     doc.caret_touched = true;
-                    // 缓冲变了，裸 URL 的位置也可能变——重扫装饰层。
-                    doc.hotspots.set(hotspot_decorations(value.as_ref()), cx);
-                    // Notepad3 补充层同理：前景装饰重建、背景区间重算。
-                    let Overlay { foreground, backgrounds } =
-                        compute_overlay(doc.language, value.as_ref());
-                    doc.overlay.set(foreground, cx);
-                    doc.has_backgrounds = backgrounds.iter().any(|span| span.ink.bg.is_some());
-                    *doc.backgrounds.borrow_mut() = backgrounds;
-                    // 内容一变，布局也随之变；清掉滚动偏移缓存，免得下一帧拿旧值平移。
-                    *doc.bg_offset.borrow_mut() = None;
+                    doc.text_rev = doc.text_rev.wrapping_add(1);
+                    // 派生层（热点 / 补充层 / 大纲）按尺寸分两档重算：
+                    // - 小文档立刻算，观感与从前完全一致；
+                    // - 大文档记一笔"欠一次"，由防抖任务在停手后合并做一次。这一层从前
+                    //   是每次按键全量重扫（2 MiB 的 Markdown 约 8 ms，批处理更贵），
+                    //   正是"大文件打字迟滞"的主要来源。
+                    if doc.derived_pending {
+                        // 已经排了任务：它醒来时读的是最新缓冲，这里不必再动手。
+                    } else if doc.input.read(cx).text().len() > DERIVED_SYNC_MAX_BYTES {
+                        doc.derived_pending = true;
+                        let target = doc.input.clone();
+                        let mut seen = doc.text_rev;
+                        cx.spawn_in(window, async move |this, cx| loop {
+                            cx.background_executor().timer(DERIVED_DEBOUNCE).await;
+                            // 醒来之后再看一眼：这一轮等待期间又改过（`seen` 对不上）就
+                            // 接着等——真正的尾沿防抖。`None` = 标签已经关掉 / 视图没了。
+                            let done = cx
+                                .update(|_window, cx| {
+                                    this.update(cx, |this, cx| {
+                                        let doc = this
+                                            .tabs
+                                            .iter_mut()
+                                            .find(|doc| doc.input == target)?;
+                                        if doc.text_rev != seen {
+                                            seen = doc.text_rev;
+                                            return Some(false);
+                                        }
+                                        doc.derived_pending = false;
+                                        let text = target.read(cx).value();
+                                        refresh_derived_layers(doc, text.as_ref(), cx);
+                                        cx.notify();
+                                        Some(true)
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .ok()
+                                .flatten();
+                            if done != Some(false) {
+                                break;
+                            }
+                        })
+                        .detach();
+                    } else {
+                        let value = doc.input.read(cx).value();
+                        refresh_derived_layers(doc, value.as_ref(), cx);
+                    }
                 }
                 cx.notify();
             }
@@ -666,6 +734,10 @@ impl Workspace {
             pinned: false,
             conflict: false,
             missing: false,
+            headings: Vec::new(),
+            derived_pending: false,
+            text_rev: 0,
+            brace_key: None,
             _changes: changes,
             _watch: watch,
             brace_matches: None,
@@ -673,11 +745,14 @@ impl Workspace {
             hotspots,
             overlay,
             backgrounds,
-            has_backgrounds,
+            has_backgrounds: false,
             caret_touched: false,
             bg_offset: Rc::new(RefCell::new(None)),
         });
         let index = self.tabs.len() - 1;
+        // 派生层（热点 / 补充层 / 大纲）一次算好。`text` 与快照同内容（就是上面那份），
+        // 直接用它，省掉再拷一次缓冲。
+        refresh_derived_layers(&mut self.tabs[index], &text, cx);
         self.error = None;
         // 自动重载是后台能力，监听起不来不该挡住打开文件，但必须说出来。
         self.status =
@@ -1240,14 +1315,10 @@ impl Workspace {
         // 视野会回到文件开头：`scroll_to` 在组件库里是 crate 内可见，公开 API 没有
         // 恢复阅读位置的办法。
         doc.input.update(cx, |state, cx| state.set_value(text, window, cx));
-        // 外部重载会整段换掉缓冲，裸 URL 位置与 Notepad3 补充层全变了——两层都重扫。
+        // 外部重载会整段换掉缓冲：派生层（热点 / 补充层 / 大纲）全部重算——与"打开"
+        // 和"每次改动"共用同一条路径，逻辑只有一份。
         let text_now = doc.input.read(cx).value();
-        doc.hotspots.set(hotspot_decorations(&text_now), cx);
-        let Overlay { foreground, backgrounds } = compute_overlay(doc.language, &text_now);
-        doc.overlay.set(foreground, cx);
-        doc.has_backgrounds = backgrounds.iter().any(|span| span.ink.bg.is_some());
-        *doc.backgrounds.borrow_mut() = backgrounds;
-        *doc.bg_offset.borrow_mut() = None;
+        refresh_derived_layers(doc, text_now.as_ref(), cx);
         cx.notify();
     }
 
@@ -2296,8 +2367,9 @@ impl Workspace {
         let preview = doc.preview;
         let has_preview = doc.kind.has_preview();
         let outline_open = doc.outline_open;
-        let has_headings = doc.kind == FileKind::Markdown
-            && !outline::headings(&doc.input.read(cx).value()).is_empty();
+        // 大纲表是缓存（`Document::headings`，由 `refresh_derived_layers` 维护）：
+        // 从前这里每帧都把整条 rope 拷成 String、再扫一遍标题，只为判断按钮要不要出现。
+        let has_headings = doc.kind == FileKind::Markdown && !doc.headings.is_empty();
         let reset_image =
             doc.kind == FileKind::Image && doc.image_geometry.zoom() != 1.0;
         let restart = crate::theme::shell_hsla();
@@ -2418,16 +2490,13 @@ impl Workspace {
         };
 
         let preview = doc.preview;
-        // 大纲只对 Markdown 有意义（解析的是标题）。面板据此出现。
-        let is_markdown = doc.kind == FileKind::Markdown;
         let outline_open = doc.outline_open;
-        // Markdown 的标题列表：每帧从编辑缓冲现算。文档不大时这远比缓存一份
-        // "标题索引 + 失效规则"省事，也不会出现"改了标题大纲没跟上"。
-        let headings = if is_markdown {
-            outline::headings(&doc.input.read(cx).value())
-        } else {
-            Vec::new()
-        };
+        // 大纲只对 Markdown 有意义（解析的是 ATX 标题），而 `headings` 就是缓存的那份
+        // 标题表——非 Markdown 的文档它一直是空的，面板据此出现。
+        //
+        // 从前这里是**每帧**现算：`InputState::value()`（整条 rope → String 的拷贝）
+        // 加上一遍全篇标题扫描；2 MiB 的 Markdown 每帧两处（动作区 + 这里）白烧 4.9 ms。
+        let headings = &doc.headings;
         let has_headings = !headings.is_empty();
 
         let body = if preview {
@@ -2476,7 +2545,7 @@ impl Workspace {
                 .h_full()
                 .min_h_0()
                 .min_w_0()
-                .child(render_outline(&headings, cx))
+                .child(render_outline(headings, cx))
                 .child(v_flex().flex_1().h_full().min_w_0().min_h_0().child(body))
                 .into_any_element()
         } else {
@@ -3733,9 +3802,17 @@ fn cycle_index(active: usize, delta: isize, len: usize) -> usize {
 
 /// 重算括号匹配并写进 `Document::brace_matches`。编辑器光标一动就被观察回调调用。
 ///
-/// 先做 O(1) 预检（光标处或左侧不是括号就直接判空），这样正常打字——绝大多数
-/// 按键都不贴着括号——不会付那次全文扫描。只有确实贴着括号时才取全文交给
-/// `brackets::matching`（它一次 `O(n)` 词法扫描，跳过字符串/注释里的括号）。
+/// 先做 O(1) 预检（光标处或左侧不是括号就直接判空），这样正常打字——绝大多数按键
+/// 都不贴着括号——不会付那次全文扫描。确实贴着括号时才交给 `brackets::matching`
+/// （它一次词法扫描，跳过字符串 / 注释里的括号）。
+///
+/// 再加一层记忆：编辑器**每 notify 一次**都会走到这里（光标移动、内容变化，还有我们
+/// 自己那两层装饰 `set`——它们在组件库里无条件 `cx.notify()`），而匹配结果只由
+/// "内容 + 光标"决定。所以钥匙没变就直接返回，一次按键最多真算一遍。
+///
+/// 取文本优先走**零拷贝**分支：`RopeSlice::as_str()` 在整条缓冲连续时能直接借出
+/// `&str`（刚打开、还没动过的文件就是这种），不必像从前那样无条件
+/// `rope.to_string()`（2 MiB 时 1.14 ms）。
 ///
 /// **只存结果、不 notify**：`brace_matches` 是普通字段，写它不会触发重绘，所以
 /// 不存在 "写 → notify → observe → 写" 的自激循环（早先用组件库的
@@ -3744,21 +3821,30 @@ fn cycle_index(active: usize, delta: isize, len: usize) -> usize {
 fn refresh_brace_marks(doc: &mut Document, cx: &mut Context<Workspace>) {
     let matches = {
         let state = doc.input.read(cx);
-        let rope = state.text();
         let cursor = state.cursor();
+        let key = (doc.text_rev, cursor);
+        if doc.brace_key == Some(key) {
+            // 内容与光标都没动：上一次的结论——包括"这里没有配对"——依然成立。
+            return;
+        }
+        doc.brace_key = Some(key);
+        let rope = state.text();
         let is_bracket = |i: usize| {
             matches!(rope.get_byte(i), Some(b'(' | b')' | b'[' | b']' | b'{' | b'}'))
         };
         if !is_bracket(cursor) && !(cursor > 0 && is_bracket(cursor - 1)) {
             None
         } else {
-            crate::brackets::matching(&rope.to_string(), cursor)
+            let slice = rope.slice(0..rope.len());
+            match slice.as_str() {
+                Some(text) => crate::brackets::matching(text, cursor),
+                None => crate::brackets::matching(&slice.to_string(), cursor),
+            }
         }
     };
     if matches == doc.brace_matches {
         return;
     }
-    doc.brace_matches = matches;
     cx.notify();
 }
 
@@ -3841,6 +3927,46 @@ fn compute_overlay(language: &str, text: &str) -> Overlay {
     }
     let spans = np3::spans(language, text);
     Overlay { foreground: foreground_decorations(&spans), backgrounds: spans }
+}
+
+/// 派生层（裸 URL 热点、Notepad3 补充层、Markdown 大纲）在"大文档"上的防抖窗口。
+///
+/// 这三层都是**全缓冲扫描**：实测 2 MiB 的文件里热点 1.9 ms、补充层 4.1 ms、大纲
+/// 1.3 ms，批处理的补充层更贵（见 AGENTS.md「补充层」）。小文档每次改动立刻重算，
+/// 观感与从前完全一致；超过 [`DERIVED_SYNC_MAX_BYTES`] 就把它们推迟到"停手"之后合并
+/// 做一次——都是纯视觉层，晚一个防抖窗口看不出差别，换来的是打字延迟不再随文件线性
+/// 增长（从前是每次按键都付这笔钱）。
+const DERIVED_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// 超过这个尺寸的文档才走 [`DERIVED_DEBOUNCE`]。
+///
+/// 256 KiB 时三层合计约 1.5 ms/次，和一次按键的其它开销同一个量级，不值得为它引入
+/// "晚一点才上色"。所以小文件保持"打了字立刻上色"的老行为。
+const DERIVED_SYNC_MAX_BYTES: usize = 256 * 1024;
+
+/// 重算一个文档的派生层。
+///
+/// 调用点只有三个——打开、缓冲变更、外部重载——都是"内容整体换了"的时刻，所以三处
+/// 共用一个实现。`text` 由调用侧给出：调用侧往往已经因为别的原因拿过一份
+/// （`InputState::value()` 每次调用都是一次全量 rope→String 拷贝，避免在这里再拷一次）。
+///
+/// 这里同时是"大纲缓存"的**唯一**刷新点：`Document::headings` 是缓存，渲染路径直接读它
+/// （从前每帧在动作区与内容区各现算一次，2 MiB 的 Markdown 每帧白烧 4.9 ms）。
+fn refresh_derived_layers(doc: &mut Document, text: &str, cx: &mut Context<Workspace>) {
+    // 内容版本号：程序化换内容（`set_value`）不发 `InputEvent::Change`，所以这里也要
+    // 记一笔——括号高亮的记忆钥匙与防抖任务都靠它判断"内容变没变"。
+    doc.text_rev = doc.text_rev.wrapping_add(1);
+    doc.hotspots.set(hotspot_decorations(text), cx);
+    let Overlay { foreground, backgrounds } = compute_overlay(doc.language, text);
+    doc.overlay.set(foreground, cx);
+    doc.has_backgrounds = backgrounds.iter().any(|span| span.ink.bg.is_some());
+    *doc.backgrounds.borrow_mut() = backgrounds;
+    // 内容一变，布局也随之变；清掉滚动偏移缓存，免得下一帧拿旧值平移。
+    *doc.bg_offset.borrow_mut() = None;
+    // 大纲只对 Markdown 有意义（解析的是 ATX 标题），其余语言保持空表。
+    if doc.kind == FileKind::Markdown {
+        doc.headings = outline::headings(text);
+    }
 }
 
 #[cfg(test)]

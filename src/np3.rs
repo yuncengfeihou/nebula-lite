@@ -91,15 +91,28 @@ pub fn spans(language: &str, text: &str) -> Vec<Span> {
 }
 
 /// 逐行遍历，给出 `(行号, 行首字节, 去掉行尾换行后的行末字节)`。
-fn lines(text: &str) -> Vec<(usize, usize, usize)> {
-    let mut out = Vec::new();
-    let mut offset = 0;
-    for (row, line) in text.split_inclusive('\n').enumerate() {
+///
+/// 是**迭代器**而不是 `Vec`：这份列表"每行一项"，2 MiB 的 .bat 约 4.7 万行，摊成
+/// `Vec<(usize, usize, usize)>` 就是每次重算白分配 1.1 MB（三个语言层 markdown / ini /
+/// batch 都只用顺序遍历，不需要随机访问）。行尾的 `\n` / `\r` 按字节判断，不走
+/// `trim_end_matches` 的 char 模式机。
+fn lines(text: &str) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let mut offset = 0usize;
+    text.split_inclusive('\n').enumerate().map(move |(row, line)| {
         let start = offset;
         offset += line.len();
-        out.push((row, start, start + line.trim_end_matches(['\n', '\r']).len()));
+        (row, start, start + pre_newline_len(line))
+    })
+}
+
+/// 行尾换行（`\n` / `\r`）之前的字节长度。
+fn pre_newline_len(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
     }
-    out
+    end
 }
 
 fn span(row: usize, start: usize, end: usize, ink: Ink) -> Span {
@@ -442,16 +455,45 @@ fn batch(text: &str) -> Vec<Span> {
 }
 
 /// 行首是否是 `rem` 注释（`rem` 后必须是空白、行尾或 `.`；`remove` 不算）。
+///
+/// 按字节做大小写无关的前缀比较，**不**整行 `to_ascii_lowercase()`：那会给每一行分配
+/// 一个 String，是 `spans()` 在大 .bat 上变贵的两个来源之一（见 [`lower_word`]）。
 fn starts_with_rem(rest: &str) -> bool {
-    let lower = rest.to_ascii_lowercase();
-    match lower.strip_prefix("rem") {
-        Some(tail) => {
-            tail.is_empty()
-                || tail.starts_with(|c: char| c.is_ascii_whitespace())
-                || tail.starts_with('.')
-        },
-        None => false,
+    let bytes = rest.as_bytes();
+    // `bytes[..3]` 与 `rem` 相等 ⇒ 前三个字节都是 ASCII，于是 `rest[3..]` 落在字符边界上。
+    if bytes.len() < 3 || !bytes[..3].eq_ignore_ascii_case(b"rem") {
+        return false;
     }
+    let tail = &rest[3..];
+    tail.is_empty()
+        || tail.starts_with(|c: char| c.is_ascii_whitespace())
+        || tail.starts_with('.')
+}
+
+/// 逐词小写用的栈缓冲大小。
+///
+/// 比这更长的词不可能出现在关键字表里（表里最长的 `disabledelayedexpansion` 也才 23
+/// 字节），所以超长直接按"不是关键字"处理，不必分配。
+const WORD_BUFFER: usize = 64;
+
+/// 把 `word` 按 ASCII 小写写进栈缓冲，返回供关键字表比较的切片。
+///
+/// `None` = 词长超过 [`WORD_BUFFER`]：不可能是关键字，调用侧按"不是关键字"处理即可。
+/// 非 ASCII 字节原样拷贝——关键字表全是 ASCII，拷贝后仍是合法 UTF-8，比较必然不等，
+/// 与旧实现（`to_ascii_lowercase()` 只降 ASCII、其余原样）的结果一致。
+///
+/// 为什么要这么绕：`tokenize_line` 对**每一个词**都要拿小写形态去查关键字表，原先
+/// 每词一次 `to_ascii_lowercase()` 就是每词一次堆分配。P0 的批量文件里词最密，那一项
+/// 把 `spans("batch", ..)` 推到 25 ms/MiB（实测见 AGENTS.md「补充层」）。
+fn lower_word<'a>(word: &str, buffer: &'a mut [u8; WORD_BUFFER]) -> Option<&'a str> {
+    let bytes = word.as_bytes();
+    if bytes.len() > WORD_BUFFER {
+        return None;
+    }
+    for (slot, byte) in buffer.iter_mut().zip(bytes) {
+        *slot = byte.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buffer[..bytes.len()]).ok()
 }
 
 /// 把一行拆成变量 / 运算符 / 单词并判色。
@@ -466,6 +508,8 @@ fn tokenize_line(
     let body = &text[line_start..end];
     let bytes = body.as_bytes();
     let mut i = from;
+    // 逐词小写用的栈缓冲：整个循环共用一份，不再每个词分配一个 String。
+    let mut word_buffer = [0u8; WORD_BUFFER];
     // 行首或分隔符之后是命令位置：未知词是 "Command"（黑粗体），已知词是关键字（蓝粗体）；
     // 命令行中间的未知词是普通文本（黑、不加粗）。
     let mut command_pos = true;
@@ -543,7 +587,7 @@ fn tokenize_line(
             i += 1;
             continue;
         }
-        let word = body[word_start..i].to_ascii_lowercase();
+        let word = lower_word(&body[word_start..i], &mut word_buffer).unwrap_or("");
 
         // `rem` 起头即注释：整行剩余部分染绿（Notepad3 在词级也会这么判）。
         if word == "rem" {
@@ -553,7 +597,7 @@ fn tokenize_line(
 
         let ink = if plain {
             Ink::fg(BLACK)
-        } else if is_bat_keyword(&word) {
+        } else if is_bat_keyword(word) {
             Ink::bold(BAT_KEYWORD)
         } else if command_pos {
             Ink { fg: Some(BLACK), bg: None, bold: true, eol: false }
@@ -562,7 +606,7 @@ fn tokenize_line(
         };
         out.push(span(row, line_start + word_start, line_start + i, ink));
 
-        if BAT_PLAIN_TAIL.contains(&word.as_str()) {
+        if BAT_PLAIN_TAIL.contains(&word) {
             plain = true;
         }
         // `set` 之后紧跟的那个 `=` 是赋值运算符（Notepad3 的 `isNotAssigned`）。
@@ -575,12 +619,20 @@ fn tokenize_line(
         // 只有少数关键字（`start` / `call` / `do`）之后的下一个词可能是命令；
         // 其余关键字（含 `if`）之后回到普通文本——这正是 `if 1==2` 里的 `1` 不上色、
         // 而 `out.txt` 在 `if exist out.txt` 里也不上色的原因（Notepad3 的 cmdLoc）。
-        command_pos = !plain && BAT_OPENS_COMMAND.contains(&word.as_str());
+        command_pos = !plain && BAT_OPENS_COMMAND.contains(&word);
     }
 }
 
+/// `word`（已小写）是否在 `KeyWords_BAT` 里，即 Notepad3 的"内部命令 / 常用外部工具"。
+///
+/// 用**二分查找**而不是 `BAT_KEYWORDS.contains(..)`：表里有 151 个词，线性扫是每个词
+/// 151 次比较，而 .bat 的词很密、每个词都要查三张表——这一项就是批处理层在大文件上
+/// 的主要开销（实测 25 ms/MiB → 见 AGENTS.md「补充层」）。
+///
+/// 二分的前提是表按字节序升序：它本身就是逐值照抄 `KeyWords_BAT` 的顺序，
+/// 由 `keyword_table_is_sorted_for_binary_search` 钉住。
 fn is_bat_keyword(word: &str) -> bool {
-    BAT_KEYWORDS.contains(&word)
+    BAT_KEYWORDS.binary_search(&word).is_ok()
 }
 
 /// 变量 token 的字节长度；`i` 指向 `%` 或 `!`。照 `LexBatch` 的几种形态。
@@ -848,6 +900,47 @@ mod tests {
     }
 
     #[test]
+    fn batch_rem_stays_case_insensitive_after_the_fast_path() {
+        // `starts_with_rem` 改成按字节比较之后，大小写不敏感与尾部边界两条规则都要不变。
+        assert_eq!(find("REM note\n", &batch("REM note\n"), "REM note"), Ink::fg(BAT_COMMENT));
+        assert_eq!(find("ReM.note\n", &batch("ReM.note\n"), "ReM.note"), Ink::fg(BAT_COMMENT));
+        // `remx`：`rem` 之后既不是空白、也不是行尾或 `.`，不算注释。
+        let src = "remx\n";
+        let spans = batch(src);
+        assert!(!text_of(src, &spans).iter().any(|(_, ink)| *ink == Ink::fg(BAT_COMMENT)));
+    }
+
+    #[test]
+    fn lower_word_handles_case_non_ascii_and_overlong_words() {
+        let mut buffer = [0u8; WORD_BUFFER];
+        assert_eq!(lower_word("SET", &mut buffer), Some("set"));
+        // 非 ASCII 字节原样拷贝：仍是合法 UTF-8，只是永远不可能等于关键字表里的词。
+        assert_eq!(lower_word("中文A", &mut buffer), Some("中文a"));
+        let exact = "x".repeat(WORD_BUFFER);
+        assert_eq!(lower_word(&exact, &mut buffer), Some(exact.as_str()));
+        // 超一个字节就判"不是关键字"，不再分配。
+        assert_eq!(lower_word(&"x".repeat(WORD_BUFFER + 1), &mut buffer), None);
+    }
+
+    #[test]
+    fn batch_words_over_the_buffer_are_commands_not_keywords() {
+        // 超长词走快速路径：仍然是词（有 span、是命令位置的黑粗体），但绝不能命中关键字色。
+        let long = "a".repeat(WORD_BUFFER + 8);
+        let src = format!("{long} tail\n");
+        let spans = batch(&src);
+        assert_eq!(
+            find(&src, &spans, long.as_str()),
+            Ink { fg: Some(BLACK), bg: None, bold: true, eol: false }
+        );
+        // 把关键字重复到超长同样不命中（旧实现先分配小写串再比对，结论一致）。
+        let repeated = "if".repeat(40);
+        let src = format!("{repeated}\n");
+        let spans = batch(&src);
+        assert_eq!(find(&src, &spans, repeated.as_str()).fg, Some(BLACK));
+        assert_ne!(find(&src, &spans, repeated.as_str()), Ink::bold(BAT_KEYWORD));
+    }
+
+    #[test]
     fn batch_argument_forms() {
         let src = "call :greet %1 %%a %~dp0 !X!\n";
         let spans = batch(src);
@@ -873,6 +966,36 @@ mod tests {
         let spans = batch(src);
         assert_eq!(find(src, &spans, ":done").fg, Some(BAT_LABEL));
         assert_eq!(find(src, &spans, " something").fg, Some(BAT_AFTER_LABEL));
+    }
+
+    #[test]
+    fn keyword_table_is_sorted_for_binary_search() {
+        // `is_bat_keyword` 用二分查找，前提是这张表按字节序升序——它本身就是逐值照抄
+        // `styleLexBAT.c` 的 `KeyWords_BAT` 的顺序，本用例保证"照抄进来的顺序"确实有序，
+        // 免得以后往里插词插错位置之后关键字静默查不到。
+        assert!(
+            BAT_KEYWORDS.windows(2).all(|pair| pair[0] < pair[1]),
+            "BAT_KEYWORDS 必须按字节序升序（`is_bat_keyword` 的二分前提）"
+        );
+        // 抽查首 / 中 / 末三个词都在表里能查到，并确认不存在的词确实查不到。
+        for word in [
+            BAT_KEYWORDS[0],
+            BAT_KEYWORDS[BAT_KEYWORDS.len() / 2],
+            BAT_KEYWORDS[BAT_KEYWORDS.len() - 1],
+        ] {
+            assert!(is_bat_keyword(word), "{word} 应在关键字表里");
+        }
+        assert!(!is_bat_keyword("notakeyword"));
+        assert!(!is_bat_keyword(""), "空词不是关键字");
+    }
+
+    #[test]
+    fn lines_reports_row_start_and_pre_newline_end() {
+        // `lines` 改成迭代器之后，`(行号, 行首, 行尾)` 三个值仍要与旧实现一致：
+        // 行尾不含 `\n` / `\r`，最后一行没有换行时按实际长度收尾。
+        let text = "a\r\nbb\n\nccc";
+        let got: Vec<_> = lines(text).collect();
+        assert_eq!(got, vec![(0, 0, 1), (1, 3, 5), (2, 6, 6), (3, 7, 10)]);
     }
 
     #[test]
