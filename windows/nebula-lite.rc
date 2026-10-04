@@ -1,0 +1,43 @@
+/* nebula-lite 的 Windows 资源：应用图标 + 版本信息。
+ *
+ * 图标用**资源 ID 1**，不是 Pebrel 那边的 0x101。原因是这里必须同时满足两条
+ * 取图标的路径（见 `gpui_windows::platform::load_icon`）：
+ *   - GPUI 起窗口类时用 `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, ...)`
+ *     显式取 ID 1 的图标；取到就设成窗口类图标。
+ *   - 任务栏 / 资源管理器的图标取的是 exe 里**编号最小的 RT_GROUP_ICON**。
+ * 把图标放在 ID 1 上两条路径都命中；沿用 0x101 则 GPUI 那条取不到（退回默认
+ * 图标），任务栏倒是还能靠"最小 ID"拿到。
+ *
+ * 这里刻意**不放 RT_MANIFEST**：DPI 清单已经由 GPUI 自己嵌进 exe（README 记过
+ * RT_MANIFEST 里 dpiAware=true/pm + PerMonitorV2 是验证过的那份）。再塞一份只会
+ * 让"multiple non-default manifests"从告警变成真的赢家不确定。
+ */
+
+1 ICON "nebula-lite.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "nebula-lite"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "nebula-lite"
+            VALUE "OriginalFilename", "nebula-lite.exe"
+            VALUE "ProductName", "nebula-lite"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

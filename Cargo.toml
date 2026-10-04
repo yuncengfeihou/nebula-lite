@@ -1,0 +1,146 @@
+[package]
+name = "nebula-lite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+description = "A minimal local text editor built on the Pebrel GPUI stack"
+
+[[bin]]
+name = "nebula-lite"
+path = "src/main.rs"
+
+# 把应用图标与版本信息编进 exe（windows/nebula-lite.rc）。见 build.rs 与 .rc 里
+# 为什么图标放在资源 ID 1、为什么这里不碰清单。
+[build-dependencies]
+embed-resource = "3"
+
+# GPUI / component 的版本与 Git 来源必须与 Pebrel 完全一致：
+# Cargo 的 source identity 包含 URL，混用官方与自有 URL 会把同名类型解析成
+# 两套互不兼容的 crate（pebrel 根 Cargo.toml 的固定基线注释）。
+[dependencies]
+gpui = { git = "https://github.com/Kuddev/zed", rev = "7c662384cd77c1d1e1566206920e3a420ea6767b", version = "=0.2.2" }
+gpui_platform = { git = "https://github.com/Kuddev/zed", rev = "7c662384cd77c1d1e1566206920e3a420ea6767b", version = "=0.1.0", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/Kuddev/gpui-component", rev = "f46ecbb06de5907af9700f3f6e2b5b0845459188", version = "=0.5.2", features = ["tree-sitter-languages"] }
+gpui-component-assets = { git = "https://github.com/Kuddev/gpui-component", rev = "f46ecbb06de5907af9700f3f6e2b5b0845459188", version = "=0.5.1" }
+# Markdown 预览里的网络图片要能加载：gpui 默认装的是 NullHttpClient（一切请求
+# 直接报错）。直接复用 zed 自己的 reqwest 客户端（与 gpui 同一 git 源和 rev），
+# 既省掉一套 TLS / 连接管理，也保证 `http_client::HttpClient` 与 gpui 用的是同一
+# 个类型——不同来源的同名 crate 会解析成两套互不兼容的类型。
+reqwest_client = { git = "https://github.com/Kuddev/zed", rev = "7c662384cd77c1d1e1566206920e3a420ea6767b" }
+
+# 组件库的 `tree-sitter-languages` feature 覆盖不到 XML / PowerShell / INI（后者连
+# 注册表里都没有名字，前两者在它那份 feature 清单里根本没有）。这三个语法补在
+# 自己这边，再走组件库公开的 `LanguageRegistry::register` 注进去，见 src/lang.rs。
+#
+# 三个语法 crate 对 `tree-sitter` 只声明了 **dev** 依赖，正常依赖是
+# `tree-sitter-language`（只提供 `LanguageFn`）。所以这里必须自己引 `tree-sitter`：
+# 版本与 gpui-component 的 `tree-sitter = "0.26"` 归一，`LanguageConfig` 里的
+# `tree_sitter::Language` 才是同一个类型；版本一旦错开，cargo 会编出两份
+tree-sitter = "0.26"
+tree-sitter-xml = "0.7"
+tree-sitter-powershell = "0.26"
+tree-sitter-ini = "1.4"
+# 后四个语法 crate 本来就是 gpui-component 的传递依赖（它引它们、却把 highlights
+# 查询写成空串），这里声明成直接依赖纯属为了自己拿它们的 `HIGHLIGHTS_QUERY`。
+# 它们已经编进最终二进制了，所以不增加任何编译/体积成本。
+tree-sitter-c-sharp = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-cmake = "0.7"
+tree-sitter-javascript = "0.23"
+# TSX：组件库给 `tsx` 用的是 tree-sitter-typescript 的 `HIGHLIGHTS_QUERY`，那只是
+# TS 的**追加**查询、不含 JS 基础槽，于是 `.tsx` 几乎全无色（见 languages.rs 的
+# `register_tsx`）。这里把 crate 声明成直接依赖，好把 JS 基础查询 + TS 追加查询 +
+# JSX 追加查询拼起来。它本就是组件库的传递依赖，不新增编译成本。
+tree-sitter-typescript = "0.23"
+# C / C++：C++ 的 highlights（tree-sitter-cpp）只补 C++ 专有构造，**不含** C 的基础
+# 查询；不把 C 那份拼上去，`.cpp` 里的 `if` / `for` / `int` / 运算符 / 数字 / 字符串
+# 几乎全无颜色。两者本就是组件库的传递依赖，这里只是把它们的查询拿来直接拼。
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+# 这两个是新引入的语法（同为现代 `tree-sitter-language` 模式，见上）。
+tree-sitter-erlang = "0.20"
+tree-sitter-haskell = "0.23"
+# Windows 批处理（.bat / .cmd）。Notepad3 有 `styleLexBAT.c` 管这两个扩展名，
+# 组件库的 feature 集里没有它，所以补在这里。它的正常依赖是 `tree-sitter-language`
+# 而非 `tree-sitter`（后者只是 dev 依赖），不会拉出第二份 tree-sitter。
+tree-sitter-batch = "0.11"
+# Markdown 行内注入要换回上游那份查询（见 languages.rs 为何），它导出
+# INJECTION_QUERY_BLOCK。本来就是组件库的传递依赖，不新增编译成本。
+tree-sitter-md = "0.5"
+
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# 图片预览解码。gpui 的图像元素只吃它自己的 BGRA RenderImage，所以本地图片
+# 必须自己解码再转换（与 Pebrel doc_tabs.rs 同路数）。
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp", "ico"] }
+# 外部改动监听。只用来盯"当前文档所在目录"这一层（非递归），见 src/watch.rs
+# 为什么盯目录而不是文件本身。
+notify = "7"
+# 监听回调跑在 notify 自己的线程上，要把"文件变了"这个信号递给前台任务，
+# 中间需要一个能在 await 上等的通道。原生「选择文件夹」对话框的专用线程也用
+# 同一条通道把结果送回前台（见 src/folder_picker.rs）。
+async-channel = "2"
+# 从 gpui 的 `Window` 取原生 HWND（`HasWindowHandle`）。版本与 gpui 依赖的
+# 0.6.2 归一，不引入第二份 `raw_window_handle` 类型。
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# 目录选择器走 Shell 的 IFileOpenDialog(COM)，见 src/folder_picker.rs。
+# 只开用得到的三个 feature：Foundation(HWND/HRESULT)、
+# System_Com(CoInitializeEx/CoCreateInstance/CoTaskMemFree)、
+# UI_Shell(CLSID FileOpenDialog / FOS_* 选项位 / SIGDN)。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+# ⚠ **本地补丁：`gpui-component` 换成仓库内的截取副本。**
+#
+# 上游把编辑器的**首次**语法解析也丢进"2ms 前台预算 → 超时转后台 → 后台先等
+# 150ms 防抖"那条路，于是刚打开一个文件时有几百毫秒正文是没颜色的。补丁只改
+# 这一点（`vendor/gpui-component/crates/ui/src/input/mode.rs`：首次解析改走同步），
+# 说明见 `vendor/gpui-component/NEBULA-LITE-PATCH.md`。
+#
+# 之所以敢这么补：`[patch]` 是把这一个包**整体**换成本地路径，而不是"同一个
+# Git URL 再来一份"，所以不会出现 AGENTS.md 警告的"同名类型解析成两套互不兼容
+# 实例"。`gpui-component-assets` 必须一起换——它带 `links`，同名的两份会让
+# cargo 直接报重复链接；它也是 `ui` 的路径依赖所指向的那一份，换了才是同一个。
+[patch."https://github.com/Kuddev/gpui-component"]
+gpui-component = { path = "vendor/gpui-component/crates/ui" }
+gpui-component-assets = { path = "vendor/gpui-component/crates/assets" }
+
+# GPUI 在 opt-level 0 下窗口拖拽与持续输入会出现发布版没有的延迟
+# （pebrel 的 dev profile 注释）。外部依赖统一 O2，渲染/塑形热点保持 O3；
+# 本 crate 自己的代码仍走增量 debug，因此日常迭代重编译只花几秒。
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+
+[profile.dev.package]
+"*" = { opt-level = 2 }
+gpui = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+
+[profile.release]
+lto = "thin"
+debug = 0
+strip = "symbols"
+incremental = false
+codegen-units = 1
+opt-level = "s"
+
+[profile.release.package]
+gpui = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+# gpui_windows 的 build.rs 在 `not(debug_assertions)` 时用 fxc.exe 预编译 HLSL
+# 着色器（见其 build.rs 的 `#[cfg(not(debug_assertions))] compile_shaders()`）。
+# fxc.exe 随 Windows SDK 分发，本机没装，release 构建会直接 panic。
+# 只让这一个 crate 带 debug-assertions，它就退回运行时着色器路径——也就是
+# debug 构建实际走的那条（debug 版渲染正常，已验证）。其余 crate 仍是全优化。
+gpui_windows = { debug-assertions = true }

@@ -1,0 +1,7 @@
+[toolchain]
+# 必须用 gnu 宿主的工具链。cargo 的 `--target` 只影响最终产物，build script 与
+# proc-macro 永远按宿主三元组编译；宿主若为 msvc 就需要 MSVC 的 link.exe，而本机
+# 没装 Visual Studio（且 Git Bash 的 /usr/bin/link.exe 会被误当成它）。
+# 用 gnu 宿主后，宿主与目标都是 x86_64-pc-windows-gnu，由 mingw-w64 的 gcc 链接。
+channel = "1.97.1-x86_64-pc-windows-gnu"
+profile = "minimal"

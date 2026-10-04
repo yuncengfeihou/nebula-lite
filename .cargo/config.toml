@@ -1,0 +1,28 @@
+# 目标三元组不在这里指定：宿主工具链本身就是 gnu（见 rust-toolchain.toml）。
+
+# cargo 内建的 libgit2 在本机拉 GitHub 会超时，走 git CLI 更稳。
+[net]
+git-fetch-with-cli = true
+retry = 5
+
+# 关于 target-dir：本仓库**故意不写**这条设置，好让克隆到任何位置都能构建。
+# 只有当克隆路径含非 ASCII 字符（例如中文目录）时，才需要把构建产物挪到纯 ASCII
+# 路径下——mingw 的 C 编译器（tree-sitter 语法、freetype 等依赖要靠它编 C）对非
+# ASCII 路径会出编码问题。两种做法都只影响本机，不必写进仓库：
+#
+#   1) 在仓库**外面**的某个上级目录放 .cargo/config.toml（cargo 会沿当前目录向上查找）：
+#        [build]
+#        target-dir = "C:/some/ascii/path/target"
+#   2) 构建前设环境变量（优先级最高）：
+#        set CARGO_TARGET_DIR=C:\some\ascii\path\target
+#
+# 如果以后需要重新拉取 git 依赖（换了 fork 的 rev、或清了缓存），本机到 GitHub
+# 直连不稳定，可以借镜像并让 git 做 URL 重写（提交仍按 SHA 校验，镜像无法换内容）：
+#
+#   cd nebula-lite
+#   export GIT_CONFIG_COUNT=1
+#   export GIT_CONFIG_KEY_0="url.https://gh-proxy.com/https://github.com/.insteadOf"
+#   export GIT_CONFIG_VALUE_0="https://github.com/"
+#   cargo fetch
+#
+# 实测吞吐：gh-proxy.com ≈ 616 KB/s，直连 ≈ 217 KB/s，ghfast.top 只有 13 KB/s。

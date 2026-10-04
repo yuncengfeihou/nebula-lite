@@ -1,0 +1,10 @@
+# cargo 构建产物
+/target/
+
+# Windows 调试副产物
+*.pdb
+*.exp
+
+# 资源管理器 / 系统杂物
+Thumbs.db
+Desktop.ini
