@@ -400,6 +400,9 @@ pub struct InputState {
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    /// nebula-lite：已为哪一代"推迟的折行宽度变更"排了前台防抖任务。
+    /// 见 `InputState::schedule_pending_wrap` 与 `DisplayMap::on_layout_changed`。
+    pub(super) pending_wrap_task: Option<u64>,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_paddings: Cell<Edges<Pixels>>,
@@ -538,6 +541,7 @@ impl InputState {
             }),
             editor_scrollbar_snapshot: Cell::new(None),
             deferred_scroll_offset: None,
+            pending_wrap_task: None,
             preferred_column: None,
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
@@ -1000,6 +1004,55 @@ impl InputState {
             self.display_map.on_layout_changed(None, cx);
         }
         cx.notify();
+    }
+
+    /// 大文档的折行宽度变更被推迟了：排一个 150 ms 的**尾沿防抖**，停手之后把
+    /// 新宽度真正应用（整篇重排）并重绘。
+    ///
+    /// 由 `InputElement::prepaint` 每帧调用（推迟期间 `last_layout.wrap_width` 与
+    /// 目标宽度对不上，所以每帧都会走到这里）；任务在等待期间若发现代数变了，
+    /// 说明宽度还在变（拖动窗口 / 侧栏），接着等。
+    pub(super) fn schedule_pending_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(generation) = self.display_map.pending_wrap_generation() else {
+            return;
+        };
+        if self.pending_wrap_task.is_some() {
+            return;
+        }
+        self.pending_wrap_task = Some(generation);
+
+        const WRAP_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+        cx.spawn_in(window, async move |this, cx| {
+            let mut seen = generation;
+            loop {
+                cx.background_executor().timer(WRAP_DEBOUNCE).await;
+                let next = this
+                    .update(cx, |state, cx| {
+                        match state.display_map.pending_wrap_generation() {
+                            // 等待期间宽度又变过：真正的尾沿防抖——接着等。
+                            Some(latest) if latest != seen => Some(latest),
+                            Some(_) => {
+                                state.pending_wrap_task = None;
+                                if state.display_map.apply_pending_wrap_width(cx) {
+                                    cx.notify();
+                                }
+                                None
+                            }
+                            None => {
+                                state.pending_wrap_task = None;
+                                None
+                            }
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                match next {
+                    Some(latest) => seen = latest,
+                    None => break,
+                }
+            }
+        })
+        .detach();
     }
 
     /// Update whether to show whitespace characters.
@@ -2607,6 +2660,13 @@ impl InputState {
         self.input_bounds = new_bounds;
 
         // Update display_map wrap_width if changed.
+        //
+        // 有"待生效的宽度"时这里不动：`last_layout.wrap_width` 此时是**已生效**的
+        // 旧宽度，拿它回灌会取消掉正在等待的变更。宽度由 `prepaint` 每帧重新
+        // 计算，推迟中的那一次由防抖任务收尾。
+        if self.display_map.pending_wrap_generation().is_some() {
+            return;
+        }
         if let Some(last_layout) = self.last_layout.as_ref() {
             if wrap_width_changed {
                 let wrap_width = if !self.soft_wrap {

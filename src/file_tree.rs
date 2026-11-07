@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::text_file::display_name;
+use crate::text_file::{FileKind, TextSnapshot, display_name};
 
 /// 行高（逻辑 px）。宽松的间距：Pebrel 的侧栏行距走同一档。
 pub const ROW_HEIGHT: f32 = 28.0;
@@ -34,6 +34,17 @@ const MAX_PER_DIR: usize = 600;
 /// 目录动辄几十万条，每次击键都走一遍会把界面冻住——Pebrel 的注释原话是
 /// "walking it per keystroke froze the UI"（`display/side_panel/mod.rs:371`）。
 const SEARCH_VISIT_BUDGET: usize = 20_000;
+/// 内容过滤一轮最多打开的文本文件数。文件内容比目录条目贵得多，所以单独封顶：
+/// 命中通常集中在少量文件里，扫到上限之后继续走盘只会拖慢输入。
+const SEARCH_FILE_BUDGET: usize = 800;
+/// 内容过滤一轮最多读取的原始字节数（跳过超限文件之前先看单文件大小）。
+const SEARCH_BYTES_BUDGET: usize = 16 * 1024 * 1024;
+/// 内容过滤时单个文件的最大体积。更大的文件连编辑器自己都会截断 / 只读，
+/// 在侧栏里检索它们既慢又几乎没有信息量。
+const SEARCH_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// 命中片段的最大字符数：侧栏一行放不下更多，截在这里也免得为一条结果
+/// 复制整行几十 KB 的长段落。
+const SNIPPET_MAX_CHARS: usize = 120;
 /// 过滤时整个跳过（不列出、不递归）的目录名，照抄 Pebrel 的 `SEARCH_SKIP_DIRS`
 /// （`display/side_panel/mod.rs:377`）：全是体量、没有信号。
 ///
@@ -52,6 +63,10 @@ pub struct Row {
     pub depth: usize,
     pub is_dir: bool,
     pub expanded: bool,
+    /// 内容过滤命中时，第一个命中所在行（已 trim、截断）。普通展平与目录行为 `None`。
+    pub snippet: Option<String>,
+    /// 内容过滤命中的总次数；普通展平为 0。
+    pub hits: usize,
 }
 
 pub struct FileTree {
@@ -110,71 +125,76 @@ impl FileTree {
         rows
     }
 
-    /// 按名称过滤后的行序列。
+    /// 按**文件内容**过滤后的行序列。
     ///
     /// 与 [`Self::rows`] 的差别，以及为什么这样定：
-    /// - **忽略展开集合**：过滤时若还认收缩状态，匹配项藏在收起目录里就一条都
+    /// - **忽略展开集合**：过滤时若还认收缩状态，命中项藏在收起目录里就一条都
     ///   看不到，过滤等于失效。所以过滤态一律看整棵树。
     /// - **保留匹配项的祖先**：只列命中行会把层级信息丢掉（`main.rs` 是从哪来的
-    ///   看不出来），所以自顶向下走一遍、保留"自己命中或有子孙命中"的目录。
+    ///   看不出来），所以自顶向下走一遍、保留"有子孙命中"的目录。
     /// - 空查询回落 [`Self::rows`]，缩进与展开标记照旧。
     ///
-    /// 匹配不区分大小写（过滤器都是"记不住大小写、只想找那个名字"的用法）。
-    pub fn rows_filtered(&self, query: &str) -> Vec<Row> {
-        self.rows_filtered_with_budget(query, SEARCH_VISIT_BUDGET)
+    /// 内容匹配不区分 ASCII 大小写（中文没有大小写，按字节原样比）。结果行带
+    /// 首个命中的行内片段与命中次数，用户不必打开文件就能判断是不是想找的那份。
+    ///
+    /// 三条预算（条目 / 文件 / 字节）都是**同步读盘的上界**：过滤词一变就要重扫，
+    /// 而这里跑在 UI 线程上。超限时结果是"扫到哪儿算哪儿"——侧栏是导航面，
+    /// 不是全库检索引擎，宁可少列几条也不让输入卡住。
+    pub fn rows_matching_content(&self, query: &str) -> Vec<Row> {
+        self.rows_matching_content_with_budget(
+            query,
+            SEARCH_VISIT_BUDGET,
+            SEARCH_FILE_BUDGET,
+            SEARCH_BYTES_BUDGET,
+        )
     }
 
-    /// [`Self::rows_filtered`] 的预算可注入版本，便于测试访问预算真的生效
-    /// （真预算 2 万条，测不起）。
-    fn rows_filtered_with_budget(&self, query: &str, budget: usize) -> Vec<Row> {
-        let needle = query.trim().to_lowercase();
+    /// [`Self::rows_matching_content`] 的预算可注入版本，便于测试预算真的生效
+    /// （真预算是 2 万条 / 800 文件 / 16 MiB，测不起）。
+    fn rows_matching_content_with_budget(
+        &self,
+        query: &str,
+        entries: usize,
+        files: usize,
+        bytes: usize,
+    ) -> Vec<Row> {
+        let needle = query.trim();
         if needle.is_empty() {
             return self.rows();
         }
         let mut rows = Vec::new();
-        let mut visited = 0usize;
-        self.push_matching(&self.root, 0, &needle, budget, &mut visited, &mut rows);
+        let mut budget = ScanBudget { entries, files, bytes };
+        self.push_content_matching(&self.root, 0, needle, &mut budget, &mut rows);
         rows
     }
 
-    /// 过滤态的递归：目录若自身或其子孙命中就保留，命中行的 `expanded` 语义
-    /// 在过滤态没有意义（树整体展开），一律给 `true` 让箭头显示为"展开"。
-    ///
-    /// `budget` 是允许访问的条目总数，`visited` 是当前已访问计数：这两样是照抄
-    /// Pebrel 的 `SEARCH_VISIT_BUDGET`——限定的是遍历本身，否则一次过滤就能把
-    /// 整棵 `node_modules` 走穿。
-    fn push_matching(
+    /// 内容过滤态的递归：目录只有在子孙里有命中时才保留，`expanded` 在过滤态
+    /// 没有意义（树整体展开），一律给 `true` 让箭头显示为"展开"。
+    fn push_content_matching(
         &self,
         dir: &Path,
         depth: usize,
         needle: &str,
-        budget: usize,
-        visited: &mut usize,
+        budget: &mut ScanBudget,
         rows: &mut Vec<Row>,
     ) {
-        if depth >= MAX_DEPTH || rows.len() >= MAX_ROWS || *visited >= budget {
+        if depth >= MAX_DEPTH || rows.len() >= MAX_ROWS || budget.exhausted() {
             return;
         }
         for (path, is_dir) in read_dir_sorted(dir) {
-            if rows.len() >= MAX_ROWS || *visited >= budget {
+            if rows.len() >= MAX_ROWS || budget.exhausted() {
                 return;
             }
-            *visited += 1;
+            budget.entries -= 1;
             let name = display_name(&path);
-            // 体量目录整个跳过：既不列进结果、也不递归进去（Pebrel 同款）。
-            if is_dir
-                && SEARCH_SKIP_DIRS.iter().any(|skip| skip.eq_ignore_ascii_case(&name))
-            {
-                continue;
-            }
-            let self_matches = name.to_lowercase().contains(needle);
             if is_dir {
-                // 先递归看子孙里有没有命中，再决定这一行去留。命中的目录连同
-                // 整棵子树展开，让用户看得到"匹配所在的那片区域"。
+                // 体量目录整个跳过：既不列进结果、也不递归进去（Pebrel 同款）。
+                if SEARCH_SKIP_DIRS.iter().any(|skip| skip.eq_ignore_ascii_case(&name)) {
+                    continue;
+                }
                 let before = rows.len();
-                self.push_matching(&path, depth + 1, needle, budget, visited, rows);
-                let descendant_matches = rows.len() > before;
-                if self_matches || descendant_matches {
+                self.push_content_matching(&path, depth + 1, needle, budget, rows);
+                if rows.len() > before {
                     rows.insert(
                         before,
                         Row {
@@ -183,16 +203,20 @@ impl FileTree {
                             depth,
                             is_dir: true,
                             expanded: true,
+                            snippet: None,
+                            hits: 0,
                         },
                     );
                 }
-            } else if self_matches {
+            } else if let Some((hits, snippet)) = content_hit(&path, needle, budget) {
                 rows.push(Row {
                     name,
                     path,
                     depth,
                     is_dir: false,
                     expanded: false,
+                    snippet: Some(snippet),
+                    hits,
                 });
             }
         }
@@ -215,12 +239,96 @@ impl FileTree {
                 depth,
                 is_dir,
                 expanded,
+                snippet: None,
+                hits: 0,
             });
             if expanded {
                 self.push_children(&path, depth + 1, rows);
             }
         }
     }
+}
+
+/// 内容过滤一轮扫描的剩余预算（条目 / 文件 / 字节）。见
+/// [`FileTree::rows_matching_content`] 的注释。
+struct ScanBudget {
+    entries: usize,
+    files: usize,
+    bytes: usize,
+}
+
+impl ScanBudget {
+    fn exhausted(&self) -> bool {
+        self.entries == 0 || self.files == 0 || self.bytes == 0
+    }
+}
+
+/// 读一个文件并找 `needle`，命中时返回（命中次数，首个命中的行内片段）。
+///
+/// 跳过图片扩展名（不必为二进制浪费字节预算）、超大文件、以及解码不出文本的
+/// 二进制；每次成功读盘都从预算里扣掉文件数与字节数。
+fn content_hit(path: &Path, needle: &str, budget: &mut ScanBudget) -> Option<(usize, String)> {
+    if FileKind::of(path) == FileKind::Image {
+        return None;
+    }
+    let length = std::fs::metadata(path).ok()?.len();
+    if length > SEARCH_FILE_MAX_BYTES || length as usize > budget.bytes {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    budget.files = budget.files.saturating_sub(1);
+    budget.bytes = budget.bytes.saturating_sub(bytes.len());
+    let snapshot = TextSnapshot::decode(bytes, false);
+    if snapshot.invalid_encoding {
+        return None;
+    }
+    find_content(&snapshot.text, needle)
+}
+
+/// 不区分 ASCII 大小写的子串查找：返回命中次数与首个命中所在行的片段。
+///
+/// 按字节逐位比较而不是 `to_lowercase()` 整篇转换：后者每查一个文件就复制一份
+/// 全文，大目录下这笔分配比比较本身还贵。非 ASCII 字节不参与大小写折叠，
+/// 中文等 UTF-8 文本因此等价于精确匹配；UTF-8 的首字节互不为前缀，从字符
+/// 中间开始的窗口不会误命中。
+fn find_content(text: &str, needle: &str) -> Option<(usize, String)> {
+    let ndl = needle.as_bytes();
+    if ndl.is_empty() {
+        return None;
+    }
+    let hay = text.as_bytes();
+    let mut count = 0usize;
+    let mut first = None;
+    let mut index = 0usize;
+    while index + ndl.len() <= hay.len() {
+        if hay[index].eq_ignore_ascii_case(&ndl[0])
+            && hay[index..index + ndl.len()]
+                .iter()
+                .zip(ndl)
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            count += 1;
+            first.get_or_insert(index);
+            index += ndl.len();
+        } else {
+            index += 1;
+        }
+    }
+    let start = first?;
+    Some((count, snippet_around(text, start)))
+}
+
+/// 命中位置所在的那一行（trim 后截断到 [`SNIPPET_MAX_CHARS`] 个字符）。
+fn snippet_around(text: &str, byte: usize) -> String {
+    let line_start = text[..byte].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[byte..].find('\n').map_or(text.len(), |index| byte + index);
+    let line = text[line_start..line_end].trim();
+    let mut snippet: String = line.chars().take(SNIPPET_MAX_CHARS).collect();
+    if line.chars().count() > SNIPPET_MAX_CHARS {
+        snippet.push('…');
+    }
+    // 制表符在单行片段里按一个空格显示，避免整段被顶到很右边。
+    snippet.replace('\t', " ")
 }
 
 /// 读一层目录，目录在前、再按名字不区分大小写排序。
@@ -251,15 +359,19 @@ mod tests {
     use super::*;
 
     /// 每次用独立的临时目录，避免并行测试互相看见对方的文件。
+    ///
+    /// 每个文件给一段互不相同的内容：内容检索的测试按这些词定位，
+    /// 目录结构 / 展平相关的测试不看内容。
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("nebula-lite-tree-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("zeta")).unwrap();
         std::fs::create_dir_all(dir.join("alpha")).unwrap();
-        std::fs::write(dir.join("readme.md"), b"x").unwrap();
-        std::fs::write(dir.join("main.rs"), b"x").unwrap();
-        std::fs::write(dir.join("alpha").join("nested.rs"), b"x").unwrap();
+        std::fs::write(dir.join("readme.md"), b"readme body\n").unwrap();
+        std::fs::write(dir.join("main.rs"), b"fn entry() {\n    let UniqueNeedle = 1;\n}\n")
+            .unwrap();
+        std::fs::write(dir.join("alpha").join("nested.rs"), b"nested content\n").unwrap();
         dir
     }
 
@@ -344,44 +456,64 @@ mod tests {
         let tree = FileTree::new(dir);
         let normal: Vec<PathBuf> = tree.rows().into_iter().map(|row| row.path).collect();
         let filtered: Vec<PathBuf> =
-            tree.rows_filtered("   ").into_iter().map(|row| row.path).collect();
+            tree.rows_matching_content("   ").into_iter().map(|row| row.path).collect();
         assert_eq!(normal, filtered);
     }
 
     /// 过滤要忽略展开集合：命中的文件即使在收起的目录里也要列出来，
     /// 否则过滤等于失效（这是它与 `rows` 最关键的差别）。
     #[test]
-    fn filter_sees_into_collapsed_directories() {
+    fn content_filter_sees_into_collapsed_directories() {
         let dir = scratch("filter-collapsed");
         let tree = FileTree::new(dir);
         // `alpha` 默认是收起的，nested.rs 在普通展平里不出现。
         assert!(!tree.rows().iter().any(|row| row.name == "nested.rs"));
-        let filtered = tree.rows_filtered("nested");
+        let filtered = tree.rows_matching_content("nested content");
         let hit = filtered.iter().find(|row| row.name == "nested.rs");
         assert!(hit.is_some(), "过滤要穿透收起的目录");
     }
 
     /// 保留匹配项的祖先目录，层级才看得出来；同层不匹配的邻居不能带进来。
     #[test]
-    fn filter_keeps_ancestors_of_matches() {
+    fn content_filter_keeps_ancestors_of_matches() {
         let dir = scratch("filter-ancestors");
         let tree = FileTree::new(dir);
         let names: Vec<String> =
-            tree.rows_filtered("nested").into_iter().map(|row| row.name).collect();
+            tree.rows_matching_content("nested content").into_iter().map(|row| row.name).collect();
         assert_eq!(names, vec!["alpha", "nested.rs"], "父目录 alpha 要留着，无关的 zeta 不出现");
     }
 
-    /// 匹配不区分大小写：`README` 与 `readme` 该命中同一批。
+    /// 匹配的是**文件内容**而不是文件名：`entry` 只出现在 main.rs 的正文里，
+    /// 而 `main` 只是文件名——前者命中、后者必须一条都不出。
     #[test]
-    fn filter_is_case_insensitive() {
+    fn content_filter_matches_body_not_the_file_name() {
+        let dir = scratch("filter-content-only");
+        let tree = FileTree::new(dir);
+        assert_eq!(tree_names(&tree, "entry"), vec!["main.rs"]);
+        assert!(tree_names(&tree, "main").is_empty(), "文件名不参与匹配");
+    }
+
+    /// 内容匹配不区分 ASCII 大小写：`UNIQUENEEDLE` 与 `UniqueNeedle` 该命中同一批。
+    #[test]
+    fn content_filter_is_case_insensitive() {
         let dir = scratch("filter-case");
         let tree = FileTree::new(dir);
-        let lower: Vec<String> =
-            tree.rows_filtered("readme").into_iter().map(|row| row.name).collect();
-        let upper: Vec<String> =
-            tree.rows_filtered("README").into_iter().map(|row| row.name).collect();
-        assert_eq!(lower, vec!["readme.md"]);
-        assert_eq!(lower, upper);
+        assert_eq!(tree_names(&tree, "uniqueneedle"), vec!["main.rs"]);
+        assert_eq!(tree_names(&tree, "UNIQUENEEDLE"), vec!["main.rs"]);
+    }
+
+    /// 命中行要带上首个匹配所在行的片段与总命中次数：用户不用打开文件就能
+    /// 判断是不是想找的那份。
+    #[test]
+    fn content_filter_reports_snippet_and_hit_count() {
+        let dir = scratch("filter-hits");
+        std::fs::write(dir.join("notes.txt"), b"Alpha\nsecond line\nalpha is alpha\n").unwrap();
+        let tree = FileTree::new(dir);
+        let rows = tree.rows_matching_content("alpha");
+        let row = rows.iter().find(|row| row.name == "notes.txt").expect("应命中 notes.txt");
+        assert_eq!(row.hits, 3, "Alpha / alpha / alpha 共三处");
+        assert_eq!(row.snippet.as_deref(), Some("Alpha"), "片段取第一处命中所在行");
+        assert!(rows.iter().filter(|row| row.is_dir).all(|row| row.snippet.is_none()));
     }
 
     /// 一条都不命中时返回空，而不是回落成整棵树。
@@ -389,7 +521,7 @@ mod tests {
     fn filter_without_matches_is_empty() {
         let dir = scratch("filter-none");
         let tree = FileTree::new(dir);
-        assert!(tree.rows_filtered("zzz-no-such-file").is_empty());
+        assert!(tree.rows_matching_content("zzz-no-such-text").is_empty());
     }
 
     /// 过滤要跳过 `node_modules` / `target` 这类体量目录：既不列进来、也不递归
@@ -400,18 +532,35 @@ mod tests {
         let dir = scratch("filter-skip");
         // 命中词藏在 node_modules 里，另一份放在普通目录里做对照。
         std::fs::create_dir_all(dir.join("node_modules").join("pkg")).unwrap();
-        std::fs::write(dir.join("node_modules").join("pkg").join("grid.rs"), b"x").unwrap();
-        std::fs::write(dir.join("alpha").join("grid.rs"), b"x").unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pkg").join("grid.rs"),
+            b"grid unique payload\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("alpha").join("grid.rs"), b"grid unique payload\n").unwrap();
 
-        let names: Vec<String> =
-            tree_names(&FileTree::new(dir), "grid");
+        let names: Vec<String> = tree_names(&FileTree::new(dir), "unique payload");
         assert_eq!(names, vec!["alpha", "grid.rs"], "node_modules 整个跳过，普通目录照常命中");
 
         // 大小写不敏感：`Node_Modules` 同样跳过。
         let dir = scratch("filter-skip-case");
         std::fs::create_dir_all(dir.join("Node_Modules").join("pkg")).unwrap();
-        std::fs::write(dir.join("Node_Modules").join("pkg").join("grid.rs"), b"x").unwrap();
-        assert!(tree_names(&FileTree::new(dir), "grid").is_empty());
+        std::fs::write(
+            dir.join("Node_Modules").join("pkg").join("grid.rs"),
+            b"unique payload\n",
+        )
+        .unwrap();
+        assert!(tree_names(&FileTree::new(dir), "unique payload").is_empty());
+    }
+
+    /// 二进制文件（解不出文本）不能因为字节里恰好含命中词就被列出来。
+    #[test]
+    fn content_filter_skips_binary_files() {
+        let dir = scratch("filter-binary");
+        // 命中词只写在二进制里；文本文件都不含它。
+        std::fs::write(dir.join("zeta").join("blob.bin"), b"\x00zzap\xff\xfe").unwrap();
+        let tree = FileTree::new(dir);
+        assert!(tree_names(&tree, "zzap").is_empty());
     }
 
     /// 访问预算真的封顶遍历：预算耗尽后不再往里走，结果里不会带出更深的命中。
@@ -421,18 +570,41 @@ mod tests {
         let dir = scratch("filter-budget");
         // 顶层铺满条目，把预算全吃掉；深处藏一个命中。
         for i in 0..50 {
-            std::fs::write(dir.join(format!("filler{i:03}.txt")), b"x").unwrap();
+            std::fs::write(dir.join(format!("filler{i:03}.txt")), b"filler body").unwrap();
         }
         std::fs::create_dir_all(dir.join("deep")).unwrap();
-        std::fs::write(dir.join("deep").join("treasure.rs"), b"x").unwrap();
+        std::fs::write(dir.join("deep").join("treasure.rs"), b"treasure payload").unwrap();
 
         // 预算够：命中找得到。
-        let found = tree_names_budget(&FileTree::new(dir.clone()), "treasure", 10_000);
+        let found = tree_names_budget(&FileTree::new(dir.clone()), "treasure", 10_000, 10_000, 1 << 30);
         assert_eq!(found, vec!["deep", "treasure.rs"], "预算充足时应命中深层文件");
 
         // 预算只有几条：遍历在最外层就被截断，命中的深层文件不再出现。
-        let starved = tree_names_budget(&FileTree::new(dir), "treasure", 3);
+        let starved = tree_names_budget(&FileTree::new(dir), "treasure", 3, 10_000, 1 << 30);
         assert!(starved.is_empty(), "预算耗尽后不应继续遍历，实际 {starved:?}");
+    }
+
+    /// 文件数与字节数预算同样生效：超限之后不再打开 / 读取更多文件。
+    ///
+    /// 这里用**平铺**目录（不走 `scratch`）：`scratch` 的子目录里也有文件，会先吃掉
+    /// 一格文件预算，预算断言就不是"读到第几个文件"而是"读到第几个目录"了。
+    #[test]
+    fn filter_file_and_byte_budgets_bound_the_scan() {
+        let dir = std::env::temp_dir()
+            .join(format!("nebula-lite-tree-scan-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"needle payload\n").unwrap();
+        std::fs::write(dir.join("b.txt"), b"needle payload\n").unwrap();
+        let tree = FileTree::new(dir);
+
+        // 只允许读一个文件：按字母序只留下 a.txt。
+        let one = tree_names_budget(&tree, "needle", 10_000, 1, 1 << 30);
+        assert_eq!(one, vec!["a.txt"]);
+
+        // 字节预算比文件还小：一个都读不进来。
+        let none = tree_names_budget(&tree, "needle", 10_000, 10_000, 4);
+        assert!(none.is_empty(), "字节预算耗尽后不应再读文件，实际 {none:?}");
     }
 
     /// 两层上限都真的生效：
@@ -471,20 +643,41 @@ mod tests {
     fn filter_ignores_the_per_directory_cap() {
         let dir = scratch("filter-beyond-cap");
         for i in 0..(MAX_PER_DIR + 100) {
-            std::fs::write(dir.join(format!("filler{i:05}.txt")), b"x").unwrap();
+            std::fs::write(dir.join(format!("filler{i:05}.txt")), b"filler body").unwrap();
         }
-        // 名字排在字母表末尾，必然落在那 600 条之外。
-        std::fs::write(dir.join("zzz_treasure.rs"), b"x").unwrap();
+        // 名字与内容都排在字母表末尾，必然落在那 600 条之外。
+        std::fs::write(dir.join("zzz_treasure.rs"), b"treasure payload").unwrap();
 
         assert_eq!(tree_names(&FileTree::new(dir), "treasure"), vec!["zzz_treasure.rs"]);
     }
 
-    fn tree_names(tree: &FileTree, query: &str) -> Vec<String> {
-        tree.rows_filtered(query).into_iter().map(|row| row.name).collect()
+    /// 查找函数本身：大小写折叠、命中计数、首行片段、中文按原样匹配。
+    #[test]
+    fn find_content_counts_and_describes_the_first_hit() {
+        let (count, snippet) =
+            find_content("one needle\ntwo NEEDLE three needle\n", "needle").unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(snippet, "one needle");
+
+        let (count, snippet) = find_content("第一段\n第二段有内容\n", "内容").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(snippet, "第二段有内容");
+
+        assert!(find_content("没有这个词", "needle").is_none());
     }
 
-    fn tree_names_budget(tree: &FileTree, query: &str, budget: usize) -> Vec<String> {
-        tree.rows_filtered_with_budget(query, budget)
+    fn tree_names(tree: &FileTree, query: &str) -> Vec<String> {
+        tree.rows_matching_content(query).into_iter().map(|row| row.name).collect()
+    }
+
+    fn tree_names_budget(
+        tree: &FileTree,
+        query: &str,
+        entries: usize,
+        files: usize,
+        bytes: usize,
+    ) -> Vec<String> {
+        tree.rows_matching_content_with_budget(query, entries, files, bytes)
             .into_iter()
             .map(|row| row.name)
             .collect()

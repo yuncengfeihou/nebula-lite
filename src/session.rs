@@ -59,17 +59,15 @@ impl WindowState {
 }
 
 /// 一个标签要记住的东西（顺序即标签条的顺序）。
+///
+/// **不记面（预览 / 源码）与大纲面板**：按用户要求，那两者是**运行期的视图模式**，
+/// 切文件保持、重启回默认（源码 / 不显示大纲）。它们的落点在 `app.rs` 的
+/// `view_preview` / `view_outline`。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
     pub path: PathBuf,
     #[serde(default)]
     pub pinned: bool,
-    /// 是否停在预览面（Markdown 的富文本 / 图片）。
-    #[serde(default)]
-    pub preview: bool,
-    /// Markdown 的大纲面板是否展开。
-    #[serde(default)]
-    pub outline_open: bool,
 }
 
 /// 整份会话。
@@ -85,6 +83,9 @@ pub struct Session {
     pub sidebar_open: bool,
     /// 侧栏宽度；`0.0` = 没存过（用默认宽度）。
     pub sidebar_width: f32,
+    /// 大纲面板宽度；`0.0` = 没存过（用默认宽度）。面板本身重启后是收起的（视图
+    /// 模式不恢复），这个宽度是下次打开面板时用的。
+    pub outline_width: f32,
     /// 窗口位置尺寸；`None` = 没存过（居中打开）。
     pub window: Option<WindowState>,
 }
@@ -98,6 +99,7 @@ impl Default for Session {
             // 侧栏默认是展开的：缺字段的旧会话文件不该让侧栏莫名收起。
             sidebar_open: true,
             sidebar_width: 0.0,
+            outline_width: 0.0,
             window: None,
         }
     }
@@ -183,8 +185,6 @@ mod tests {
         TabState {
             path: PathBuf::from(path),
             pinned: false,
-            preview: false,
-            outline_open: false,
         }
     }
 
@@ -208,12 +208,11 @@ mod tests {
             tabs: vec![TabState {
                 path: PathBuf::from("C:\\工作区\\a.md"),
                 pinned: true,
-                preview: true,
-                outline_open: true,
             }],
             active: 3,
             sidebar_open: false,
             sidebar_width: 412.0,
+            outline_width: 240.0,
             window: Some(WindowState { x: -1200.0, y: 40.0, width: 900.0, height: 640.0, maximized: true }),
         };
         let json = serde_json::to_string(&session).unwrap();

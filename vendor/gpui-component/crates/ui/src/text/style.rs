@@ -20,6 +20,13 @@ pub struct TextViewStyle {
     pub highlight_theme: Arc<HighlightTheme>,
     /// The style refinement for code blocks.
     pub code_block: StyleRefinement,
+    /// Language-specific highlight theme for fenced code blocks.
+    ///
+    /// `None` falls back to `cx.theme().highlight_theme` (a single global theme).
+    /// When set, the closure receives the fence language (`None` for a fence
+    /// without one) and returns the theme used to color that block.
+    pub code_block_theme:
+        Option<Arc<dyn Fn(Option<&str>) -> Arc<HighlightTheme> + Send + Sync + 'static>>,
     /// Style refinement applied to the table container (the bordered wrapper
     /// in wrap mode, the scroll viewport in horizontal-scroll mode).
     ///
@@ -62,6 +69,7 @@ impl Default for TextViewStyle {
             heading_font_size: None,
             highlight_theme: HighlightTheme::default_light().clone(),
             code_block: StyleRefinement::default(),
+            code_block_theme: None,
             table: StyleRefinement::default(),
             table_cell: StyleRefinement::default(),
             inline_code: HighlightStyle::default(),

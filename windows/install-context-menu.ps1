@@ -25,8 +25,11 @@
 #>
 [CmdletBinding()]
 param(
-    # nebula-lite.exe 的路径。默认取本机 release 产物的位置。
-    [string]$ExePath = (Join-Path $env:USERPROFILE '.nebula-lite\target\release\nebula-lite.exe')
+    # nebula-lite.exe 的路径。默认取**工作区的 release 产物**：
+    # 2026-11-03 起取消安装副本，桌面快捷方式与右键菜单都直接指向它，
+    # 这样 `cargo build --release` 出来的就是唯一版本。
+    # 构建产物在工作区根的 `.cargo/config.toml` 里被挪到 D:\dev-cache\cargo-target。
+    [string]$ExePath = 'D:\dev-cache\cargo-target\release\nebula-lite.exe'
 )
 
 $ErrorActionPreference = 'Stop'

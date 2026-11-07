@@ -79,7 +79,17 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 # 非 UTF-8 文本（带 BOM 的 UTF-16、以及 GB18030 / GBK / GB2312）的解码与写回。
 # 它本来就是 reqwest 的传递依赖（已在 Cargo.lock 里），所以声明成直接依赖
 # 不新增任何编译或体积成本；不引它就只能自己写 GB18030 码表，那是几百 KB 的表。
-encoding_rs = "0.8"
+#
+# `fast-gb-hanzi-encode` 是**必须开的**：默认实现把汉字编到 GBK / GB18030 走的是
+# "在解码用表里线性查找 + 二分"，实测 4.8 MB 的《诡舍.txt》整篇转码要 **1.6 秒**；
+# 开了这个 feature 换成就地查表，同一份内容只要 **38 毫秒**（约 40 倍）。而一次保存
+# 至少转码一次，于是"点保存卡死数秒"就是这么来的。代价是二进制大 36 KB。
+#
+# 字节级等价性已用**全部 Unicode 码位**（U+0000..=U+10FFFF，1,112,064 个字符）
+# 加真实 4.8 MB 小说做过对拍：开/关两次 `encode` 的输出哈希完全一致，round-trip
+# 也一致。encoding_rs 官方文档同样写明这个 feature "does not affect decode speed"，
+# 只改汉字编码的查表方式，不改映射结果。
+encoding_rs = { version = "0.8", features = ["fast-gb-hanzi-encode"] }
 # 外部改动监听。只用来盯"当前文档所在目录"这一层（非递归），见 src/watch.rs
 # 为什么盯目录而不是文件本身。
 notify = "7"
@@ -143,9 +153,13 @@ opt-level = "s"
 gpui = { opt-level = 3 }
 gpui-component = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
-# gpui_windows 的 build.rs 在 `not(debug_assertions)` 时用 fxc.exe 预编译 HLSL
-# 着色器（见其 build.rs 的 `#[cfg(not(debug_assertions))] compile_shaders()`）。
-# fxc.exe 随 Windows SDK 分发，本机没装，release 构建会直接 panic。
-# 只让这一个 crate 带 debug-assertions，它就退回运行时着色器路径——也就是
-# debug 构建实际走的那条（debug 版渲染正常，已验证）。其余 crate 仍是全优化。
-gpui_windows = { debug-assertions = true }
+# 这里**不要**再给 gpui_windows 开 debug-assertions。
+#
+# 2026-10-22 之前它开着，让 release 走"运行时读 src/shaders.hlsl 再编"那条路
+# （因为本机没有 fxc.exe）。那条路把 `env!("CARGO_MANIFEST_DIR")` 的**绝对路径**
+# 烧进 exe，于是 CARGO_HOME 一搬家（10-17 从 C 盘挪到 D 盘）exe 就启动即崩：
+#   Error creating DirectWriteTextSystem / os error 3 → exit 101，窗口不出现。
+# 现在 fxc.exe 已在 D:\dev-cache\windows-sdk-tools\（用户级 GPUI_FXC_PATH 指向它），
+# build.rs 走预编译分支，着色器字节直接编进二进制，不再依赖源码目录。
+# 若哪天换了机器/清了环境变量而没有 fxc.exe，构建会在 build.rs 里直接 panic
+# （"Failed to find fxc.exe"），而不是产出一个能编过、启动才崩的 exe。

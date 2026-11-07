@@ -1672,10 +1672,17 @@ impl Element for TextElement {
             self.state.update(cx, |state, cx| {
                 state.display_map.on_layout_changed(wrap_width, cx);
                 state.display_map.set_wrapping_indent(wrapping_indent, cx);
+                // 大文档的宽度变化会被 `DisplayMap` 记为"待生效"（拖动时别每帧
+                // 整篇重排），这里保证有一个防抖任务会在停手后把它落实。
+                state.schedule_pending_wrap(window, cx);
             });
         }
 
         let state = self.state.read(cx);
+        // 折行宽度取**已生效**的那一个：推迟期间新宽度还没重排，旧折行区间仍然
+        // 可用（文本没变，只是断行位置是按旧宽度算的），照旧宽度排版才不会把
+        // 光标 / 可见区算错。
+        let wrap_width = state.display_map.applied_wrap_width();
         let line_height = input_line_height(window);
 
         let (visible_range, visible_buffer_lines, visible_top) =

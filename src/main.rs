@@ -1,3 +1,18 @@
+// 声明这是**图形应用**，不是控制台程序。
+//
+// 不加这一行，PE 头的 Subsystem 就是 `WINDOWS_CUI`（3）：双击 exe 时系统会先
+// 为它分配一个控制台窗口，然后才轮到我们的 GUI 窗口出现——用户看到的就是
+// "先弹一个黑终端、再出编辑器"（用户报的正是这个）。加上之后变成
+// `WINDOWS_GUI`（2），双击直接出窗口，行为和记事本 / VS Code 一致。
+//
+// 代价：进程没有控制台了，`println!` / panic 的 stderr 不再显示在任何地方。
+// 调试时想看输出，用 `Start-Process -RedirectStandardError` 抓（重定向仍然
+// 有效——那是管道，不是控制台），或者临时把这一行注释掉。
+//
+// 位置：`#![...]` 是内层属性，必须排在**所有 item 之前**（文档注释 `//!` 算
+// 属性的一部分，可以留在它前面）。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! nebula-lite —— 基于 Pebrel 的 GPUI 栈构建的本地文本编辑器。
 //!
 //! 复用面的取舍：主题（Paper 调色板）、字体（内嵌 Maple Mono）、代码编辑器
@@ -76,8 +91,8 @@ fn main() {
             // 外观基准是 macOS 观感的中性灰白 + 系统蓝（见 `theme` 模块顶部）。
             // 用户在设置面板里选过的字体会在 `Workspace::new` 里覆盖主题的字体字段。
             theme::apply_theme(cx);
-            // `Ctrl+S` / 标签管理 / 字号是本应用的窗口级绑定；`Ctrl+F` / `Ctrl+H` 由
-            // 组件库绑在 `"Input"` 上下文里，编辑器持有焦点时自然命中（`Workspace::activate`
+            // `Ctrl+S` / 标签管理 / 字号 / 自动换行是本应用的窗口级绑定；`Ctrl+F` /
+            // `Ctrl+H` 由组件库绑在 `"Input"` 上下文里，编辑器持有焦点时自然命中（`Workspace::activate`
             // 打开或切换文件即聚焦编辑器，见 `app.rs`）。
             // 字号三键对齐 Pebrel 的 `IncreaseFontSize` / `DecreaseFontSize`
             // 默认绑定（`config/bindings/defaults.rs` 的 `ctrl-=` / `ctrl--`）。
@@ -90,6 +105,9 @@ fn main() {
                 KeyBinding::new("ctrl-+", app::IncreaseFontSize, None),
                 KeyBinding::new("ctrl--", app::DecreaseFontSize, None),
                 KeyBinding::new("ctrl-0", app::ResetFontSize, None),
+                // 自动换行的开关：对齐 VS Code 的 `Alt+Z`（`editor.action.toggleWordWrap`）。
+                // `Ctrl+W` 已经是关标签，所以换行键必须另找一格。
+                KeyBinding::new("alt-z", app::ToggleWordWrap, None),
                 // 打开工作区目录：对齐 VS Code 的 `Ctrl+K Ctrl+O` 太啰嗦，
                 // 这里用单段 `Ctrl+Shift+O`（O = Open folder）。
                 KeyBinding::new("ctrl-shift-o", app::OpenFolder, None),

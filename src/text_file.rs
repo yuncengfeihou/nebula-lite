@@ -128,35 +128,48 @@ impl TextSnapshot {
     }
 
     /// 按原始约定编码回字节：BOM 与 CRLF 都会还原。
+    ///
+    /// **这是保存路径上唯一一次整篇转码**。两个必须知道的事实：
+    /// - GB18030 的汉字编码在 `encoding_rs` 默认配置下走"线性查找 + 二分"，4.8 MB
+    ///   的中文小说实测 **1.6 秒**；开了 `fast-gb-hanzi-encode`（见 Cargo.toml）后
+    ///   同样的内容 **38 毫秒**。这个 feature 是保存不卡的前提，别删。
+    /// - 调用方（`app::write_to_disk`）会把返回的 `Vec` 直接当成新的比对基线
+    ///   （`rebase_encoded`），**不要再对同样的文本调第二遍 encode**——那正好把
+    ///   整篇转码的成本乘二，历史上"点保存卡死数秒"就是这么来的。
     pub fn encode(&self, text: &str) -> Result<Vec<u8>, SaveError> {
         if self.read_only {
             return Err(SaveError::ReadOnly);
         }
         // 换行风格按原文件还原（`crlf` 只在整篇都是 CRLF 时才为真）。
         let body = if self.crlf { text.replace('\n', "\r\n") } else { text.to_owned() };
-        let mut bytes = Vec::new();
-        match self.encoding {
+        let bytes = match self.encoding {
             Encoding::Utf8 => {
+                let mut bytes = Vec::with_capacity(body.len() + UTF8_BOM.len());
                 if self.bom {
                     bytes.extend_from_slice(UTF8_BOM);
                 }
                 bytes.extend_from_slice(body.as_bytes());
-            }
+                bytes
+            },
             // UTF-16 的编码**不**交给 encoding_rs：它按 WHATWG 的"输出编码"概念把
             // UTF-16 归一成 UTF-8（`Encoding::output_encoding()`），`new_encoder()`
             // 因此编不出 UTF-16 字节。标准库的 `encode_utf16()` 本来就够（代理对也对）。
             Encoding::Utf16Le => {
+                let mut bytes = Vec::with_capacity(body.len() * 2 + 2);
                 bytes.extend_from_slice(&[0xFF, 0xFE]);
                 for unit in body.encode_utf16() {
                     bytes.extend_from_slice(&unit.to_le_bytes());
                 }
-            }
+                bytes
+            },
             Encoding::Utf16Be => {
+                let mut bytes = Vec::with_capacity(body.len() * 2 + 2);
                 bytes.extend_from_slice(&[0xFE, 0xFF]);
                 for unit in body.encode_utf16() {
                     bytes.extend_from_slice(&unit.to_be_bytes());
                 }
-            }
+                bytes
+            },
             Encoding::Gb18030 => {
                 let (encoded, _, had_errors) = GB18030.encode(&body);
                 if had_errors {
@@ -173,9 +186,11 @@ impl TextSnapshot {
                     )
                     .into());
                 }
-                bytes.extend_from_slice(&encoded);
-            }
-        }
+                // `into_owned` 在 `Cow::Owned` 时是零拷贝：GB18030 有汉字就一定
+                // 是 Owned，直接把这块内存拿过来，省掉一次 4.8 MB 的再拷一份。
+                encoded.into_owned()
+            },
+        };
         if bytes.len() > MAX_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -191,13 +206,15 @@ impl TextSnapshot {
         if current == self.bytes.as_ref() { Ok(()) } else { Err(SaveError::Changed) }
     }
 
-    /// 保存成功后把当前文本设为新的比对基线。
+    /// 保存成功后把**刚写出去的那份字节**设为新的比对基线。
     ///
     /// 只换 `bytes`，保留 `bom` / `crlf` / 编解码标记：一次成功保存不该把文件
     /// 原本的换行风格或 BOM 约定丢掉，否则第二次保存就会改写用户的文件格式。
-    pub fn rebase(&mut self, text: &str) -> Result<(), SaveError> {
-        self.bytes = self.encode(text)?.into();
-        Ok(())
+    ///
+    /// 参数是已经编码好的字节而不是文本——见 [`TextSnapshot::encode`] 的注释：
+    /// 再对同样的文本编码一次会让整篇转码的成本翻倍。
+    pub fn rebase_encoded(&mut self, bytes: Arc<[u8]>) {
+        self.bytes = bytes;
     }
 }
 
@@ -305,7 +322,14 @@ pub fn load_bytes(path: &Path, bytes: Vec<u8>) -> TextSnapshot {
 }
 
 /// 写回：先校验未被外部改动，再按原编码与换行风格写出。
-pub fn save(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<(), SaveError> {
+///
+/// 返回**刚写出去的那些字节**，供调用方直接当作新的比对基线
+/// （[`TextSnapshot::rebase_encoded`]）。别把它丢掉再去 `encode` 一遍——那会让
+/// 整篇转码的成本白白翻倍。
+pub fn save(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<Arc<[u8]>, SaveError> {
+    // 冲突检测必须读回整份文件并逐字节比对：单看长度 + mtime 会漏掉"长度不变、
+    // 时间戳也落在同一刻度里"的外部改写。4.8 MB 的读回 + memcmp 实测合计只要
+    // 1.6 ms，相比整篇转码可以忽略，不值得为它牺牲正确性。
     if let Ok(current) = std::fs::read(path) {
         snapshot.verify(&current)?;
     }
@@ -316,14 +340,15 @@ pub fn save(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<(), Save
 ///
 /// 与 [`save`] 分成两个函数、而不是给 `save` 加个 bool 参数：绕过冲突检测是必须
 /// 在调用点被看见的决定，不该藏在一个默认参数里。
-pub fn save_over(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<(), SaveError> {
+pub fn save_over(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<Arc<[u8]>, SaveError> {
     write(path, snapshot, text)
 }
 
-fn write(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<(), SaveError> {
-    let bytes = snapshot.encode(text)?;
-    std::fs::write(path, bytes)?;
-    Ok(())
+/// 编码 + 落盘，返回写出去的字节（复用给基线，见 [`save`] 的注释）。
+fn write(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<Arc<[u8]>, SaveError> {
+    let bytes: Arc<[u8]> = snapshot.encode(text)?.into();
+    std::fs::write(path, &bytes)?;
+    Ok(bytes)
 }
 
 /// 文件类型分流：决定右上角是否有"源码/预览"切换，以及预览用什么渲染。
@@ -331,6 +356,10 @@ fn write(path: &Path, snapshot: &TextSnapshot, text: &str) -> Result<(), SaveErr
 pub enum FileKind {
     /// Markdown：源码 / 富文本预览。
     Markdown,
+    /// HTML：源码 / 阅读模式预览（组件库不支持 CSS / JS，见 `render_preview`）。
+    Html,
+    /// SVG：源码 / 光栅化后的图像预览（复用图片查看器的缩放平移）。
+    Svg,
     /// 图片：源码（字节）/ 图像预览。
     Image,
     /// 其余一律当文本打开。
@@ -345,6 +374,10 @@ impl FileKind {
             .map(|extension| extension.to_ascii_lowercase());
         match ext.as_deref() {
             Some("md" | "markdown") => Self::Markdown,
+            // 与 `lang.rs` 里归 HTML 语法的扩展名一致：这些文件都能交给
+            // `TextView::html` 当标记文档读。
+            Some("html" | "htm" | "xhtml" | "shtml" | "hta" | "htc") => Self::Html,
+            Some("svg") => Self::Svg,
             Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif") => Self::Image,
             _ => Self::Text,
         }
@@ -352,7 +385,7 @@ impl FileKind {
 
     /// 是否有可切换的预览面。
     pub fn has_preview(self) -> bool {
-        matches!(self, Self::Markdown | Self::Image)
+        !matches!(self, Self::Text)
     }
 }
 
@@ -600,8 +633,13 @@ mod tests {
     fn file_kind_routes_preview_faces() {
         assert_eq!(FileKind::of(Path::new("a.md")), FileKind::Markdown);
         assert_eq!(FileKind::of(Path::new("a.PNG")), FileKind::Image);
+        assert_eq!(FileKind::of(Path::new("a.html")), FileKind::Html);
+        assert_eq!(FileKind::of(Path::new("a.XHTML")), FileKind::Html);
+        assert_eq!(FileKind::of(Path::new("a.svg")), FileKind::Svg);
         assert_eq!(FileKind::of(Path::new("a.zzz")), FileKind::Text);
         assert!(FileKind::Markdown.has_preview());
+        assert!(FileKind::Html.has_preview());
+        assert!(FileKind::Svg.has_preview());
         assert!(FileKind::Image.has_preview());
         // 普通文件没有预览面，只有编辑器。
         assert!(!FileKind::Text.has_preview());

@@ -141,6 +141,12 @@ impl WrapMap {
         &self.wrapper
     }
 
+    /// 当前**已经生效**的折行宽度（`None` = 不折行）。
+    #[inline]
+    pub fn applied_wrap_width(&self) -> Option<Pixels> {
+        self.wrapper.wrap_width()
+    }
+
     /// Get the line item by buffer row index.
     #[inline]
     pub(crate) fn line(&self, row: usize) -> Option<&LineItem> {

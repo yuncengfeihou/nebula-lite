@@ -1,6 +1,6 @@
-//! 应用设置的持久化：两个字体槽位 + 两张字体列表的顶置项。
+//! 应用设置的持久化：两个字体槽位、两张字体列表的顶置项、字号倍率、自动换行。
 //!
-//! 落盘位置 `%APPDATA%\nebula-lite\settings.json`。为什么要有这个模块：字体是
+//! 落盘位置 `%APPDATA%\nebula-lite\settings.json`。为什么要有这个模块：这些是
 //! **用户偏好**，从工作区 / 磁盘上推导不出来，不落盘就只能每次启动回默认值
 //! （用户报的"界面字体改了、一重启又变回默认"）。
 //!
@@ -9,8 +9,8 @@
 //!   不该让编辑器打不开。字段全带 `#[serde(default)]`，所以旧版本写的文件也能读。
 //! - 写入失败只写一行 stderr（`%APPDATA%` 不可写这种事，用户改不了字体也没意义
 //!   去打断他）。
-//! - 这里只存"不能从别处推导出来的东西"。窗口位置、标签集合这类没做（会话恢复
-//!   是另一件事，见 README「未做」）。
+//! - 这里只存"不能从别处推导出来的东西"。窗口位置、标签集合、以及**运行期的
+//!   预览 / 大纲视图模式**都不在这里（前者是会话恢复，后者按用户要求重启即回默认）。
 //!
 //! 顶置项存的是**字体名**而不是下标：字体目录来自系统枚举，装/卸一个字体就会
 //! 让下标错位。
@@ -37,6 +37,12 @@ pub struct Settings {
     pub pinned_ui_fonts: Vec<String>,
     /// 被顶置的编辑器字体。
     pub pinned_editor_fonts: Vec<String>,
+    /// 字号倍率（连续值，夹在 0.75–1.25）。`None` = 没设过（中号）。存的是**倍率**
+    /// 而不是像素值：界面文字与编辑器字号共用这一条数轴，落盘成具体像素就没法在
+    /// 换了基准值之后仍然对应同一档。
+    pub font_scale: Option<f32>,
+    /// 自动换行。`None` = 没设过（不换行，与从前的行为一致）。
+    pub word_wrap: Option<bool>,
 }
 
 impl Settings {
@@ -167,9 +173,22 @@ mod tests {
             editor_font: Some("Maple Mono Normal NF CN".to_owned()),
             pinned_ui_fonts: vec!["A".to_owned(), "B".to_owned()],
             pinned_editor_fonts: vec!["C".to_owned()],
+            font_scale: Some(1.25),
+            word_wrap: Some(true),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let restored: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings, restored);
+    }
+
+    /// 新增字段缺省时不能影响老文件：老版本写的设置文件里没有字号 / 换行，
+    /// 读进来必须是"没设过"，由调用侧回落默认值。
+    #[test]
+    fn older_files_without_the_new_fields_still_load() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"ui_font":"X","pinned_ui_fonts":["A"]}"#).unwrap();
+        assert_eq!(settings.font_scale, None);
+        assert_eq!(settings.word_wrap, None);
+        assert_eq!(settings.pinned_ui_fonts, vec!["A".to_owned()]);
     }
 }

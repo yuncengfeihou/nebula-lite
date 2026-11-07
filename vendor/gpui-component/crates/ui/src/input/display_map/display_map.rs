@@ -29,13 +29,29 @@ use crate::input::rope_ext::RopeExt as _;
 pub struct DisplayMap {
     wrap_map: WrapMap,
     fold_map: FoldMap,
+    /// 大文档上**推迟生效**的新折行宽度；见 [`DisplayMap::on_layout_changed`]。
+    pending_wrap_width: Option<Pixels>,
+    /// 每次登记新的待生效宽度就加一。前台防抖任务按它判断"自己是不是最后那一次"。
+    pending_wrap_generation: u64,
 }
+
+/// 超过这个体积的文档，折行宽度变化（拖动窗口 / 侧栏、改窗口大小）推迟到
+/// 停手之后合并做一次。
+///
+/// 整篇重排是 O(全文) 的塑形：4.8 MB 的 .txt 一次约 200 ms（见本文件
+/// `TextWrapper::update` 上方的说明）。拖动时每一帧都变宽度，同步重排就等于
+/// 每一帧冻 200 ms；推迟之后拖动期间沿用旧折行（文字暂时按旧宽度断行，右缘可能
+/// 被裁掉），停手 150 ms 后一次性重排。256 KiB 以下的文档重排只要几毫秒，
+/// 仍然即时生效，观感不变。
+const DEFERRED_WRAP_MIN_BYTES: usize = 256 * 1024;
 
 impl DisplayMap {
     pub fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
             wrap_map: WrapMap::new(font, font_size, wrap_width),
             fold_map: FoldMap::new(),
+            pending_wrap_width: None,
+            pending_wrap_generation: 0,
         }
     }
 
@@ -227,8 +243,57 @@ impl DisplayMap {
 
     /// Update layout parameters (wrap width or font)
     pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
+        let applied = self.wrap_map.applied_wrap_width();
+        if applied == wrap_width {
+            self.pending_wrap_width = None;
+            return;
+        }
+
+        // 大文档 + 折行开着（已生效宽度与目标宽度都是 `Some`）：宽度变化多半来自
+        // 拖动窗口 / 侧栏，每帧重排会持续冻结界面。先记下目标宽度，由前台防抖
+        // 任务在停手后调用 [`DisplayMap::apply_pending_wrap_width`] 合并做一次。
+        // 首次折行（`applied == None`）与关掉折行（目标 `None`）都不走这条路：
+        // 前者没有旧折行可沿用，后者本身很便宜。
+        if self.wrap_map.text().len() >= DEFERRED_WRAP_MIN_BYTES
+            && applied.is_some()
+            && wrap_width.is_some()
+        {
+            if self.pending_wrap_width != Some(wrap_width.unwrap()) {
+                self.pending_wrap_width = wrap_width;
+                self.pending_wrap_generation = self.pending_wrap_generation.wrapping_add(1);
+            }
+            return;
+        }
+
+        self.pending_wrap_width = None;
         self.wrap_map.on_layout_changed(wrap_width, cx);
         self.rebuild_fold_projection();
+    }
+
+    /// 当前**已经生效**的折行宽度（推迟期间仍是旧值，渲染要按它排版）。
+    #[inline]
+    pub fn applied_wrap_width(&self) -> Option<Pixels> {
+        self.wrap_map.applied_wrap_width()
+    }
+
+    /// 是否有一次推迟中的宽度变更；返回的代数供防抖任务判重。
+    #[inline]
+    pub fn pending_wrap_generation(&self) -> Option<u64> {
+        self.pending_wrap_width
+            .map(|_| self.pending_wrap_generation)
+    }
+
+    /// 把推迟中的宽度真正应用（整篇重排）。返回是否真的做了重排。
+    pub fn apply_pending_wrap_width(&mut self, cx: &mut App) -> bool {
+        let Some(wrap_width) = self.pending_wrap_width.take() else {
+            return false;
+        };
+        if self.wrap_map.applied_wrap_width() == Some(wrap_width) {
+            return false;
+        }
+        self.wrap_map.on_layout_changed(Some(wrap_width), cx);
+        self.rebuild_fold_projection();
+        true
     }
 
     /// Set the wrapping indent for continuation lines.

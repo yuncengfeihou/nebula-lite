@@ -26,12 +26,15 @@ use gpui::{
     size, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _, h_flex,
+    // `Root` 用来在根上挂组件库的**对话框层**（`render_dialog_layer`），见 `render`。
+    ActiveTheme as _, Icon, IconName, Root, Sizable as _, TitleBar, WindowExt as _, h_flex,
+    animation::ease_out_cubic,
     input::Input, input::InputEvent,
     input::InputState,
     input::{TextDecoration, TextDecorationCollection},
     menu::{PopupMenu, PopupMenuItem},
-    scroll::ScrollableElement as _, text::TextView, text::TextViewStyle, v_flex,
+    scroll::ScrollableElement as _, slider::{Slider, SliderEvent, SliderState},
+    text::TextView, text::TextViewStyle, v_flex,
 };
 use image::Frame;
 
@@ -47,7 +50,21 @@ use crate::urls;
 use crate::watch::{self, FileWatch, Signal};
 use crate::session;
 
-actions!(nebula_lite, [SaveDocument, CloseTab, NextTab, PreviousTab, IncreaseFontSize, DecreaseFontSize, ResetFontSize, OpenFolder]);
+actions!(
+    nebula_lite,
+    [
+        SaveDocument,
+        CloseTab,
+        NextTab,
+        PreviousTab,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
+        OpenFolder,
+        /// 自动换行开关（`Alt+Z`）。
+        ToggleWordWrap,
+    ]
+);
 
 
 /// 侧栏宽度（逻辑 px）。宽松布局：给长文件名留出余量。也是拖动调宽后的初始值。
@@ -70,10 +87,20 @@ const BAND_PAD_X: f32 = 12.0;
 const HEADER_HEIGHT: f32 = BAND_HEIGHT;
 /// 标签条高度。与 [`BAND_HEIGHT`] 同值。
 const TAB_HEIGHT: f32 = BAND_HEIGHT;
-/// 大纲面板宽度（内容区左侧的一竖条）。
+/// 大纲面板宽度（内容区左侧的一竖条）。也是拖动调宽后的初始值。
 const OUTLINE_WIDTH: f32 = 200.0;
+/// 大纲面板宽度的可拖范围（逻辑 px）。上限比侧栏小：它是"扫一眼标题"的辅助栏，
+/// 占掉正文一半宽度就失去意义了。
+const MIN_OUTLINE_WIDTH: f32 = 120.0;
+const MAX_OUTLINE_WIDTH: f32 = 420.0;
 /// 单个标签里的文件名字段上限，超出截断并显示省略号。
 const TAB_LABEL_WIDTH: f32 = 148.0;
+/// 设置面板里字体候选列表的视口高度（逻辑 px）与单行高度。
+///
+/// 列表是虚拟化的（见 `Workspace::render_font_list`）：这里的高度就是"一次看得见
+/// 多少行"的窗口。204 = 6 行整（34 × 6），不露半行；挑字体时用搜索缩小范围。
+const FONT_LIST_HEIGHT: f32 = 204.0;
+const FONT_ROW_HEIGHT: f32 = 34.0;
 
 /// Markdown 预览的**阅读栏宽**（逻辑 px）。
 ///
@@ -86,8 +113,17 @@ const LINE_HEIGHT: f32 = 1.55;
 /// 编辑器字号下限 / 上限（逻辑 px），与 Pebrel 终端 `zoom_font_size` 同档。
 const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 32.0;
-/// 默认编辑器字号，也是 `Ctrl+0` 的归位值。
+/// 默认编辑器字号：**中号档位**下的值，也是 `Ctrl+0` 的归位基准。
 const DEFAULT_FONT_SIZE: f32 = 13.0;
+/// 字号数轴的区间：小号（75%）/ 中号（100%）/ 大号（125%）。倍率相对**中号**，
+/// 也就是上面的默认字号与 `theme::UI_FONT_SIZE`。
+///
+/// 设置面板把它画成一条连续数轴（三个刻度是基准点），倍率同时定下界面文字
+/// （`Theme::font_size`，即窗口的 rem 基准）与编辑器 / 预览的**基准**字号。
+/// `Ctrl+=` / `Ctrl+-` 仍只在编辑器上做微调（那是"代码区缩放"）。
+const FONT_SCALE_SMALL: f32 = 0.75;
+const FONT_SCALE_MEDIUM: f32 = 1.0;
+const FONT_SCALE_LARGE: f32 = 1.25;
 /// 一次滚轮"档"的像素基准，与 Pebrel 图片缩放的 `pixel_delta(px(40.0))` 同源。
 const WHEEL_STEP_PX: f32 = 40.0;
 /// gpui 把一格滚轮换算成 3 行（`window.rs::SCROLL_LINES = 3`，与 x11 平台保持
@@ -108,6 +144,16 @@ const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 /// 频率从"每次重绘（约 2 次/秒）"降到"每秒一次"。
 const TREE_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 侧栏内容检索的尾沿防抖窗口。
+///
+/// 过滤现在按**文件内容**匹配（每个候选文件都要读盘、解码、扫描），不能再像从前
+/// 按文件名那样每次击键都同步做一遍。停手 120ms 之后只扫一次：连续输入期间界面
+/// 保持响应，最后一次输入立刻拿到结果。
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Markdown 预览里点击代码块复制按钮后，按钮显示对勾的时长。
+const COPIED_CODE_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1400);
+
 /// 会话文件的写入节流窗口。
 ///
 /// 窗口拖动 / 侧栏拖动是**连续**事件，每帧写一次盘没必要（虽然文件只有几百字节）。
@@ -124,8 +170,13 @@ pub struct Workspace {
     error: Option<String>,
     /// 最近一次动作的反馈（保存结果等），显示在状态栏。
     status: Option<String>,
-    /// `--preview`：有预览面的文件一律以预览打开，而不是先给源码。
-    prefer_preview: bool,
+    /// **运行期的视图模式**：预览面。全局一份——切到别的文件依然保持（用户要的
+    /// "切到预览之后就一直是预览"），重启回默认（源码）。初值是命令行的 `--preview`。
+    /// 图片不跟随它（图片自带一面一态，见 [`shows_preview`]）。
+    view_preview: bool,
+    /// **运行期的视图模式**：Markdown 大纲面板是否展开。与 `view_preview` 同一套约定
+    /// （全局 + 只在运行期）。
+    view_outline: bool,
     /// 侧栏过滤框。空查询 = 不折叠，显示整棵树。
     filter: Entity<InputState>,
     /// 过滤框的输入订阅。必须持有：`Subscription` 一被丢弃就退订。
@@ -140,6 +191,10 @@ pub struct Workspace {
     sidebar_width: f32,
     /// 正在拖侧栏分割线：由分割线的 `on_mouse_down` 立起、`on_mouse_up` 清掉。
     sidebar_dragging: bool,
+    /// 大纲面板宽度（逻辑 px）。拖它右缘那根分割线改它，见 [`Self::resize_outline`]。
+    outline_width: f32,
+    /// 正在拖大纲分割线（与 `sidebar_dragging` 同一套：立旗 + 窗口级监听改宽）。
+    outline_dragging: bool,
     /// 侧栏是否展开。点标题栏左侧的应用图标切换；收起后内容区占满整行。
     sidebar_open: bool,
     /// 会话状态（标签 / 激活项 / 树根 / 侧栏 / 窗口）。改了就写盘，见 [`Self::persist_session`]。
@@ -151,8 +206,15 @@ pub struct Workspace {
     /// 标题栏左上角的应用图标（`main.rs::load_app_icon` 解码好的 BGRA 图）。
     /// `None` 时那一位回落成文字标签，窗口一样能开。
     app_icon: Option<Arc<RenderImage>>,
-    /// 编辑器与预览的字号（逻辑 px）。`Ctrl+滚轮` / `Ctrl+=` / `Ctrl+-` 改它。
+    /// 编辑器与预览的字号（逻辑 px）。`Ctrl+滚轮` / `Ctrl+=` / `Ctrl+-` 改它；
+    /// `Ctrl+0` 归位到当前档位的基准值（`scaled_font_size(font_scale)`）。
     font_size: f32,
+    /// 字号倍率（连续值，夹在 0.75–1.25）。设置面板里的数轴改它：
+    /// 界面文字（`Theme::font_size`，也就是窗口的 rem 基准）与上一条的基准字号一起动。
+    font_scale: f32,
+    /// 自动换行。开着时编辑器按容器宽度折行（不再有横向滚动）。`Alt+Z` 与设置面板
+    /// 改它，**所有标签一起改**——它是全局观感，不是每个标签各一份。
+    word_wrap: bool,
     /// `true` 时不画编辑器的默认当前行高亮：当前行只在那之后被测到过鼠标点击 /
     /// 键盘输入（`Document::caret_touched`）时才亮。
     ///
@@ -175,9 +237,16 @@ pub struct Workspace {
     /// 行缓存上次重建的时刻。超过 [`TREE_REFRESH`] 就重新展平一次，让文件树的
     /// 外部增删仍然跟得上（见常量的注释）。
     rows_at: std::time::Instant,
+    /// 过滤词的代数：每次输入自增。防抖任务醒来时若代数已经变了（期间又打过字），
+    /// 这次扫描就直接作废，由最后一次输入派出的任务收尾。
+    filter_generation: u64,
     /// 侧栏 `uniform_list` 的滚动句柄。必须持有：`uniform_list` 通过它读写
     /// 滚动位置，不持有的话滚动位置每帧都会重置。
     tree_scroll: UniformListScrollHandle,
+    /// 设置面板里两个字体槽位的滚动句柄。两个 `uniform_list` 各持一份，滚动因此天然
+    /// 独立（从前靠"两个源码行"骗组件库的调用点位置，见 `render_font_list`）。
+    font_scroll_ui: UniformListScrollHandle,
+    font_scroll_editor: UniformListScrollHandle,
     /// 当前已装入全局 `highlight_theme` 的语法语言。
     ///
     /// 组件库的高亮主题是全局单例（没有"每个输入框各一份"的口子），所以"按语言
@@ -186,8 +255,16 @@ pub struct Workspace {
     installed_syntax: Option<&'static str>,
     /// 设置面板是否打开。
     settings_open: bool,
-    /// 设置面板里的字体过滤词（两个字体列表共用一份）。
+    /// 设置面板里的字体过滤词（两个槽位共用一份）。
     font_filter: Entity<InputState>,
+    /// 设置面板里当前选中的字体槽位标签（界面 / 编辑器）。
+    settings_font_slot: FontSlot,
+    /// 「字号」数轴滑条的实体状态（75–125）。
+    font_scale_slider: Entity<SliderState>,
+    /// 滑条的输入订阅（Change / Release）。必须持有：`Subscription` 一被丢弃就退订。
+    _font_scale_changes: Option<Subscription>,
+    /// 字号动画的代数：点刻度启动一次补间，拖动滑条或再点刻度会让旧任务作废。
+    font_scale_animation: u64,
     /// 过滤框的输入订阅（同 `_filter_changes` 的约定：需持有）。
     _font_filter_changes: Option<Subscription>,
     /// 可选字体目录，启动时从系统取一次（`cx.text_system().all_font_names()`）。
@@ -205,6 +282,9 @@ pub struct Workspace {
     /// 字体目录来自系统枚举，装/卸一个字体就会让下标错位。
     ui_font_pins: Vec<String>,
     editor_font_pins: Vec<String>,
+    /// Markdown 预览里"刚刚复制过的代码块"：`(代码块源码位置, 复制时刻)`。
+    /// 复制按钮据此在 [`COPIED_CODE_FEEDBACK`] 内显示对勾。
+    copied_code: Option<(usize, std::time::Instant)>,
     /// Ctrl 是否按着。由窗口级修饰键监听维护（见 `render_pan_layer`），决定源码面
     /// 是否盖一层"抓手"平移层、以及鼠标是不是换成抓手图标。
     ctrl_down: bool,
@@ -243,7 +323,7 @@ struct TreeMenu {
 
 /// 设置面板里的两个字体槽位：界面 / 标题字体、编辑器 / 预览字体。用来区分同一份
 /// 字体列表在两次渲染里点的是哪一项，也用来给行元素编稳定的 id。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FontSlot {
     Ui,
     Editor,
@@ -273,16 +353,22 @@ struct Document {
     snapshot: TextSnapshot,
     /// 源码面：始终存在，因为任何文件都能以文本形态显示。
     input: Entity<InputState>,
-    /// 图片预览的解码结果；只有图片会有。
+    /// 图片预览的解码结果，或 SVG 预览的光栅化结果；只有图片与 SVG 会有。
     image: Option<Arc<RenderImage>>,
-    /// 图片预览的缩放 / 平移几何；只有图片有意义（其它类型保持默认值）。
+    /// SVG 光栅化结果对应的缓冲版本（`text_rev`）。上一次渲染过期了没有，据此判断。
+    /// 图片走文件解码，不用这个字段。
+    svg_rev: u64,
+    /// 图片预览的缩放 / 平移几何；只有图片与 SVG 有意义（其它类型保持默认值）。
     image_geometry: ImageGeometry,
     /// 图片查看区的上一帧矩形（窗口坐标），缩放/拖拽的事件换算用它。
     /// 绘制本身不依赖它——canvas 的 paint 拿的是当帧 bounds。
     image_area: Rc<RefCell<Bounds<Pixels>>>,
-    /// Markdown 大纲面板是否展开。只有 Markdown 用得着。
-    outline_open: bool,
-    /// true 显示预览面，false 显示源码面。
+    /// 图片的预览面开关（`true` = 显示图片本身）。
+    ///
+    /// **只有图片有这个状态**：其余类型"看哪一面"来自运行期视图模式
+    /// （`Workspace::view_preview`）。图片不跟随那个模式——它的字符面是有损解码出来
+    /// 的乱码，没有阅读价值，所以打开就是预览面，用户临时切到源码面也只是这一次的事
+    /// （见 [`shows_preview`]）。
     preview: bool,
     /// 编辑缓冲与磁盘基线是否不同。
     dirty: bool,
@@ -371,6 +457,7 @@ impl Workspace {
     pub fn new(
         root: PathBuf,
         initial_file: Option<PathBuf>,
+        // `--preview`：有预览面的文件一开始就落在预览面（运行期视图模式的初值）。
         prefer_preview: bool,
         // 上次的会话（`None` = 第一次跑 / 会话文件坏了）。只在这里用于恢复。
         session: Option<session::Session>,
@@ -379,7 +466,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         // 过滤框先建好：它是侧栏的一部分，`render_sidebar` 每帧都要读它的值。
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("按名称过滤…"));
+        // 现在的过滤按**文件内容**匹配（见 `FileTree::rows_matching_content`），
+        // 占位提示要跟着说清楚，否则用户会以为在按名字找。
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件内容…"));
         let font_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索字体…"));
         // 字体目录只在建视图时取一次：`all_font_names` 每次都会走一遍系统字体集，
@@ -404,19 +493,35 @@ impl Workspace {
             &font_catalog,
             fonts::REQUIRED_FONT_FAMILY,
         );
-        // 侧栏状态：会话里有就按会话的（宽度夹回合法区间——换了显示器或缩放比之后
-        // 旧宽度可能不合理），没有就用默认值。
+        // 侧栏与大纲面板的宽度：会话里有就按会话的（夹回合法区间——换了显示器或缩放比
+        // 之后旧宽度可能不合理），没有就用默认值。大纲面板本身重启后是收起的（视图模式
+        // 不恢复），这个宽度留给下次打开面板用。
         let (sidebar_open, sidebar_width) = match &session {
             Some(saved) => (saved.sidebar_open, clamp_sidebar_width(saved.sidebar_width)),
             None => (true, SIDEBAR_WIDTH),
         };
+        let outline_width = match &session {
+            Some(saved) => clamp_outline_width(saved.outline_width),
+            None => OUTLINE_WIDTH,
+        };
+        // 字号倍率与自动换行是**设置**（跨重启记住），与上一条的视图模式不同。
+        let font_scale = clamp_font_scale(settings.font_scale.unwrap_or(FONT_SCALE_MEDIUM));
+        let word_wrap = settings.word_wrap.unwrap_or(false);
+        let font_scale_slider = cx.new(|_| {
+            SliderState::new()
+                .min(FONT_SCALE_SMALL * 100.0)
+                .max(FONT_SCALE_LARGE * 100.0)
+                .step(1.0)
+                .default_value(font_scale * 100.0)
+        });
         let mut workspace = Self {
             tree: FileTree::new(root),
             tabs: Vec::new(),
             active: 0,
             error: None,
             status: None,
-            prefer_preview,
+            view_preview: prefer_preview,
+            view_outline: false,
             filter,
             _filter_changes: None,
             tab_menu: None,
@@ -425,18 +530,29 @@ impl Workspace {
             sidebar_width,
             sidebar_dragging: false,
             sidebar_open,
+            outline_width,
+            outline_dragging: false,
             app_icon,
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: scaled_font_size(font_scale),
+            font_scale,
+            word_wrap,
             hide_default_current_line: true,
             rows: Vec::new(),
             rows_query: String::new(),
             rows_rev: u64::MAX,
             tree_rev: 0,
             rows_at: std::time::Instant::now(),
+            filter_generation: 0,
             tree_scroll: UniformListScrollHandle::new(),
+            font_scroll_ui: UniformListScrollHandle::new(),
+            font_scroll_editor: UniformListScrollHandle::new(),
             installed_syntax: None,
             settings_open: false,
             font_filter,
+            settings_font_slot: FontSlot::Ui,
+            font_scale_slider,
+            _font_scale_changes: None,
+            font_scale_animation: 0,
             _font_filter_changes: None,
             session: session.clone().unwrap_or_default(),
             session_saved_at: std::time::Instant::now(),
@@ -446,35 +562,63 @@ impl Workspace {
             editor_font: editor_font.clone(),
             ui_font_pins: settings.pinned_ui_fonts,
             editor_font_pins: settings.pinned_editor_fonts,
+            copied_code: None,
             ctrl_down: false,
             pan_drag: None,
         };
-        // 字体设置必须在**首个窗口渲染之前**写进全局主题：标题栏、标签条、侧栏、
-        // 状态栏都没有显式指定字族，吃的就是 `Theme::font_family`。晚一步会先闪
-        // 一帧默认字体。编辑器与预览另有 `self.editor_font`（见 `set_editor_font`）。
+        // 字体与字号必须在**首个窗口渲染之前**写进全局主题：标题栏、标签条、侧栏、
+        // 状态栏都没有显式指定字族，吃的就是 `Theme::font_family`；而界面文字的
+        // `text_xs` / `text_sm` 全按 `Theme::font_size`（窗口的 rem 基准）算。晚一步
+        // 会先闪一帧默认字体与默认字号。编辑器与预览另有 `self.editor_font` /
+        // `self.font_size`（见 `set_editor_font` / `sync_mono_font_size`）。
         {
             let theme = gpui_component::Theme::global_mut(cx);
             theme.font_family = ui_font;
             theme.mono_font_family = editor_font;
+            theme.font_size = crate::theme::UI_FONT_SIZE * font_scale;
+            theme.mono_font_size = px(scaled_font_size(font_scale) * crate::theme::MONO_FONT_RATIO);
         }
-        // 过滤词一变：行缓存作废（不然树还停在旧筛选结果上）+ 重渲染。
+        // 过滤词一变：安排一次内容扫描。扫描要读盘、解码，不能每个按键都同步做
+        // （见 [`SEARCH_DEBOUNCE`]）——清空过滤词是例外，立即回整棵树，不该让
+        // "清掉搜索框"也等一个防抖窗口。
         //
         // 事件驱动之后 `sync_rows` 就不必**每帧**去读一次过滤框（那次读会走
         // `InputState::value()`，即一次 rope → String 拷贝）——只在真正要重新展平时才读。
-        workspace._filter_changes =
-            Some(cx.subscribe_in(&workspace.filter, window, |this, _, event, _, cx| {
+        workspace._filter_changes = Some(cx.subscribe_in(
+            &workspace.filter,
+            window,
+            |this, _, event, window, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.invalidate_tree();
-                    cx.notify();
+                    this.schedule_search(window, cx);
                 }
-            }));
-        // 设置面板的字体过滤词同理：一变就重渲染（两个字体列表跟着筛）。
+            },
+        ));
+        // 设置面板的字体过滤词同理：一变就重渲染（当前槽位的列表跟着筛）。
         workspace._font_filter_changes =
             Some(cx.subscribe_in(&workspace.font_filter, window, |_, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
             }));
+        // 字号数轴：拖动期间即时生效、不落盘（Change）；松手才写设置（Release）。
+        // 拖动一开始就把正在跑的刻度动画作废，免得两边抢着改同一个值。
+        workspace._font_scale_changes = Some(cx.subscribe_in(
+            &workspace.font_scale_slider,
+            window,
+            |this, _, event: &SliderEvent, _window, cx| {
+                let value = match event {
+                    SliderEvent::Change(value) | SliderEvent::Release(value) => value.end(),
+                };
+                if matches!(event, SliderEvent::Change(_)) {
+                    this.font_scale_animation = this.font_scale_animation.wrapping_add(1);
+                }
+                this.apply_font_scale(
+                    value / 100.0,
+                    matches!(event, SliderEvent::Release(_)),
+                    cx,
+                );
+            },
+        ));
         // 会话恢复：先把上次的标签摆回来（`restore_tabs` 已经滤掉不在磁盘上的），
         // 再处理命令行给的文件。
         let restored = match &session {
@@ -509,6 +653,38 @@ impl Workspace {
     /// 展开集合或文件系统结构变了：让行缓存失效。
     fn invalidate_tree(&mut self) {
         self.tree_rev = self.tree_rev.wrapping_add(1);
+    }
+
+    /// 过滤词变了：清空立即回整棵树，其它情况等 [`SEARCH_DEBOUNCE`] 之后重扫。
+    ///
+    /// 内容检索要读盘 + 解码，连续输入时每次击键都扫一遍会把界面拖住；这里只
+    /// 给最后一次输入派出的任务发"通过"信号（代数对得上才生效）。
+    fn schedule_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        let generation = self.filter_generation;
+        if self.filter_query(cx).trim().is_empty() {
+            self.invalidate_tree();
+            self.rows_at = std::time::Instant::now() - TREE_REFRESH;
+            cx.notify();
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            cx.update(|_window, cx| {
+                this.update(cx, |this, cx| {
+                    // 等待期间又打过字：这次扫描作废，由更新的那个任务收尾。
+                    if this.filter_generation == generation {
+                        this.invalidate_tree();
+                        // 过滤词变化必须下一帧就重算，不受每秒一次的外部刷新节流。
+                        this.rows_at = std::time::Instant::now() - TREE_REFRESH;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 打开一个工作区目录：把文件树换到那个根，并停掉不再需要的目录监听。
@@ -586,6 +762,11 @@ impl Workspace {
     /// （展开/收起、外部改动事件），或者缓存已经超过 [`TREE_REFRESH`] 那么旧。后者是
     /// "文件树跟着外部变化刷新"那条既有行为的落脚点——展平要同步读盘，原实现每帧都做，
     /// 这里把它节流到每秒一次；重绘本身仍然照旧（光标闪烁约每秒两次）。
+    ///
+    /// **但内容检索不跟这条定时刷新**：那档刷新只是"重新走一遍目录"，而按内容过滤要
+    /// 为每个候选文件读盘 + 解码 + 扫描。挂着检索词时空转每秒一次，等于让空闲界面
+    /// 持续吃 IO。所以到期而树版本与过滤词都没变时，过滤态直接沿用上一批结果
+    /// （改一下检索词、或展开/收起一下就会重扫）。
     fn sync_rows(&mut self, cx: &gpui::App) {
         let stale = self.rows_at.elapsed() >= TREE_REFRESH;
         if self.rows_rev == self.tree_rev && !stale {
@@ -594,7 +775,12 @@ impl Workspace {
         // 过滤词只在真要重展平时才读（过滤框有自己的订阅在改它时作废缓存，
         // 见 `Workspace::new` 里的 `_filter_changes`）。
         let query = self.filter_query(cx);
-        self.rows = self.tree.rows_filtered(&query);
+        if self.rows_rev == self.tree_rev && !query.trim().is_empty() {
+            // 只有"到期"这一个理由：把时间戳推到当下，别每帧再判一次。
+            self.rows_at = std::time::Instant::now();
+            return;
+        }
+        self.rows = self.tree.rows_matching_content(&query);
         self.rows_query = query;
         self.rows_rev = self.tree_rev;
         self.rows_at = std::time::Instant::now();
@@ -672,7 +858,9 @@ impl Workspace {
                 .code_editor(language)
                 .line_number(true)
                 .indent_guides(true)
-                .soft_wrap(false)
+                // 自动换行跟随全局设置（`word_wrap`）：切行是第一眼观感，不该每个标签
+                // 各有一套，设置面板与 `Alt+Z` 都改这一个值。
+                .soft_wrap(self.word_wrap)
         });
         input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
 
@@ -689,10 +877,9 @@ impl Workspace {
         // 尺寸来自解码结果，供缩放/平移的基准比例用；非图片留 `None`。
         let image_dimensions = image.as_ref().and_then(image_dimensions);
 
-        // 图片的"字符"没有阅读意义，默认落在预览面；Markdown 与普通文本默认
-        // 落在源码面（先显示字符，需要渲染时再切）。`--preview` 让有预览面的
-        // 文件一律以预览打开。
-        let preview = kind.has_preview() && (kind == FileKind::Image || self.prefer_preview);
+        // 图片的"字符"没有阅读意义，打开就是预览面；Markdown 与普通文本跟随**运行期
+        // 视图模式**（`shows_preview`）——所以这里只记图片自己那一面。
+        let preview = kind == FileKind::Image;
 
         // 订阅必须挂在 `set_value` 之前创建、并持有到标签关闭：否则第一次
         // 载入内容的变化事件就会漏掉。事件按**输入实体**回找标签：标签下标会随
@@ -789,9 +976,9 @@ impl Workspace {
             snapshot,
             input,
             image,
+            svg_rev: 0,
             image_geometry: ImageGeometry::new(image_dimensions),
             image_area: Rc::new(RefCell::new(Bounds::default())),
-            outline_open: false,
             preview,
             dirty: false,
             pinned: false,
@@ -824,16 +1011,15 @@ impl Workspace {
         Some(index)
     }
 
-    /// 把刚落下的标签编辑成会话里记的那个样子（固定 / 预览面 / 大纲面板）。
+    /// 把刚落下的标签编辑成会话里记的那个样子（目前只有"固定"）。
+    ///
+    /// 面（预览 / 源码）与大纲面板**不在会话里**：按用户要求它们是运行期视图模式，
+    /// 切文件保持、重启回默认（源码 / 不显示大纲）。见 `session::TabState` 的注释。
     fn apply_tab_state(&mut self, index: usize, tab: &session::TabState) {
         let Some(doc) = self.tabs.get_mut(index) else {
             return;
         };
         doc.pinned = tab.pinned;
-        // 预览面只对"有预览面"的类型有意义，大纲只对 Markdown 有意义——会话文件可能
-        // 被手改过，也可能来自更早的版本，这里的与运算就是那道闸。
-        doc.preview = tab.preview && doc.kind.has_preview();
-        doc.outline_open = tab.outline_open && doc.kind == FileKind::Markdown;
     }
 
     /// 恢复上次的会话：把标签集合摆回来。返回是否真的摆回了标签。
@@ -879,22 +1065,17 @@ impl Workspace {
         self.persist_session_throttled();
     }
 
-    /// 立即写一份会话文件（标签 / 激活项 / 树根 / 侧栏 / 窗口）。
+    /// 立即写一份会话文件（标签 / 激活项 / 树根 / 侧栏与大纲宽度 / 窗口）。
     fn persist_session(&mut self) {
         self.session.root = Some(self.tree.root().to_path_buf());
         self.session.tabs = self
             .tabs
             .iter()
-            .map(|doc| session::TabState {
-                path: doc.path.clone(),
-                pinned: doc.pinned,
-                preview: doc.preview,
-                outline_open: doc.outline_open,
-            })
+            .map(|doc| session::TabState { path: doc.path.clone(), pinned: doc.pinned })
             .collect();
         self.session.active = self.active;
-        self.session.sidebar_open = self.sidebar_open;
         self.session.sidebar_width = self.sidebar_width;
+        self.session.outline_width = self.outline_width;
         self.session.save();
         self.session_saved_at = std::time::Instant::now();
     }
@@ -921,7 +1102,15 @@ impl Workspace {
         }
         self.active = index;
         let path = self.tabs[index].path.clone();
-        let preview = self.tabs[index].preview;
+        // 该不该抢焦点要看**实际显示哪一面**（视图模式 + 图片自己那一面），
+        // 不能只看 `Document::preview`——Markdown 的面是全局的。
+        let preview =
+            shows_preview(self.tabs[index].kind, self.tabs[index].preview, self.view_preview);
+        // SVG 的预览是光栅化结果，缓存跟着缓冲版本走：切换标签 / 运行期视图模式
+        // 打开后才第一次渲染，之后内容没变就直接复用。
+        if preview {
+            refresh_svg_preview(&mut self.tabs[index], cx);
+        }
         self.tree.reveal(&path);
         self.tree.selected = Some(path);
         // reveal 可能展开了若干祖先目录，行缓存要作废（否则树还停在旧内容上）。
@@ -1030,10 +1219,12 @@ impl Workspace {
     }
 
     /// 放大 / 缩小编辑器与预览字号。`delta` 是逻辑 px 的步进。
-    ///
     /// 与 Pebrel 的 `zoom_font_size` 同一套约定：一步 1 逻辑 px、钳在固定区间。
     /// 字号是**全局**的（工作区一份），不是每个标签一份——用户的"字太小"是对
     /// 整个应用的判断，切个标签就变回去会很别扭。
+    ///
+    /// 它改的是**编辑器 / 预览**这一层，不动界面文字：界面大小是设置面板里的
+    /// 字号倍率（`apply_font_scale`），两者是"整体倍率"与"代码区微调"的关系。
     fn bump_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         let next = (self.font_size.round() + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         if (next - self.font_size).abs() < f32::EPSILON {
@@ -1045,14 +1236,114 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `Ctrl+0`：字号回到默认值。
+    /// `Ctrl+0`：字号回到**当前档位**的基准值。
     fn reset_font_size(&mut self, cx: &mut Context<Self>) {
-        if (self.font_size - DEFAULT_FONT_SIZE).abs() < f32::EPSILON {
+        let base = scaled_font_size(self.font_scale);
+        if (self.font_size - base).abs() < f32::EPSILON {
             return;
         }
-        self.font_size = DEFAULT_FONT_SIZE;
-        self.status = Some(format!("字号 {DEFAULT_FONT_SIZE:.0}px"));
+        self.font_size = base;
+        self.status = Some(format!("字号 {base:.0}px"));
         self.sync_mono_font_size(cx);
+        cx.notify();
+    }
+
+    /// 应用字号倍率（数轴拖动 / 刻度动画共用）。
+    ///
+    /// `persist == false` 时只改运行期与主题、不写设置文件：拖动期间每秒会来几十次
+    /// 事件，每次都写盘没有必要；松手（`SliderEvent::Release`）或动画结束时才落盘。
+    fn apply_font_scale(&mut self, scale: f32, persist: bool, cx: &mut Context<Self>) {
+        let scale = clamp_font_scale(scale);
+        let size = scaled_font_size(scale);
+        if (self.font_scale - scale).abs() < f32::EPSILON
+            && (self.font_size - size).abs() < f32::EPSILON
+        {
+            // 拖动期间已经应用过一次，松手这步通常"值没变"；但落盘要靠这里。
+            if persist {
+                self.save_settings();
+            }
+            return;
+        }
+        self.font_scale = scale;
+        self.font_size = size;
+        gpui_component::Theme::global_mut(cx).font_size = crate::theme::UI_FONT_SIZE * scale;
+        self.sync_mono_font_size(cx);
+        if persist {
+            self.save_settings();
+        }
+        cx.notify();
+    }
+
+    /// 点「小 / 中 / 大」刻度：让滑条和整界面字号一起补间到目标值。
+    ///
+    /// 拖动滑条本身是直接跟手的，不需要补间；这里只服务"点刻度跳档"这种一步到位
+    /// 的动作。每次启动都把代数 +1，拖动 / 再点刻度会让上一段动画自行作废。
+    fn animate_font_scale(&mut self, target: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let target = clamp_font_scale(target);
+        let start = self.font_scale;
+        if (target - start).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_scale_animation = self.font_scale_animation.wrapping_add(1);
+        let generation = self.font_scale_animation;
+        let slider = self.font_scale_slider.clone();
+        const STEPS: u32 = 12;
+        cx.spawn_in(window, async move |this, cx| {
+            for step in 1..=STEPS {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(15))
+                    .await;
+                let t = step as f32 / STEPS as f32;
+                let value = start + (target - start) * ease_out_cubic(t);
+                let alive = cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            if this.font_scale_animation != generation {
+                                return false;
+                            }
+                            slider.update(cx, |state, cx| {
+                                state.set_value(value * 100.0, window, cx);
+                            });
+                            this.apply_font_scale(value, step == STEPS, cx);
+                            true
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 切换自动换行（`Alt+Z` 与设置面板共用）。
+    fn toggle_word_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = !self.word_wrap;
+        self.set_word_wrap(next, window, cx);
+    }
+
+    /// 设置自动换行：所有**已打开**的标签一起改，并落盘。
+    ///
+    /// 为什么不每个标签各一份：换行是"这份代码怎么读"的整屏观感，用户按 `Alt+Z`
+    /// 之后切到另一个文件还是折行的行，才是他预期的行为（与字号同理）。
+    ///
+    /// `InputState::set_soft_wrap` 会按已有的 `last_layout` 重算折行宽度并复位横向
+    /// 滚动，所以不需要我们自己重建编辑器（重建会丢掉撤销历史）。
+    fn set_word_wrap(&mut self, wrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.word_wrap == wrap {
+            return;
+        }
+        self.word_wrap = wrap;
+        for doc in &mut self.tabs {
+            doc.input.update(cx, |state, cx| state.set_soft_wrap(wrap, window, cx));
+        }
+        // 折行之后横向滚动就不再有意义，抓手平移那层也就没有目标了（同 `toggle_preview`）。
+        self.ctrl_down = false;
+        self.pan_drag = None;
+        self.status = Some(String::from(if wrap { "自动换行：开" } else { "自动换行：关" }));
+        self.save_settings();
         cx.notify();
     }
 
@@ -1100,7 +1391,6 @@ impl Workspace {
             return;
         }
         self.activate(index, window, cx);
-        let tab_count = self.tabs.len();
         let pinned = self.tabs[index].pinned;
         let workspace = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |mut menu, _window, _cx| {
@@ -1112,25 +1402,12 @@ impl Workspace {
                     }
                 }
             };
+            // 只剩「固定此标签」（用户要求去掉三个"关闭"条目：标签上的 `×` 与
+            // `Ctrl+W` 已经能关标签，菜单里再放三条是重复）与三条系统动作。
             menu = menu
                 .item(
-                    PopupMenuItem::new(if pinned { "取消固定" } else { "固定" })
+                    PopupMenuItem::new(if pinned { "取消固定此标签" } else { "固定此标签" })
                         .on_click(run(TabCommand::TogglePin)),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new("关闭此标签")
-                        .on_click(run(TabCommand::Close)),
-                )
-                .item(
-                    PopupMenuItem::new("关闭其它标签")
-                        .disabled(tab_count < 2)
-                        .on_click(run(TabCommand::CloseOthers)),
-                )
-                .item(
-                    PopupMenuItem::new("关闭右侧标签")
-                        .disabled(index + 1 >= tab_count)
-                        .on_click(run(TabCommand::CloseToRight)),
                 )
                 .separator()
                 .item(
@@ -1159,28 +1436,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 关闭 `index` 之外的全部标签。保留的那个成为激活项。
-    fn close_other_tabs(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() {
-            return;
-        }
-        let keep = self.tabs.remove(index);
-        self.tabs.clear();
-        self.tabs.push(keep);
-        self.activate(0, window, cx);
-    }
-
-    /// 关闭 `index` 右侧的所有标签。
-    fn close_tabs_to_right(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() {
-            return;
-        }
-        self.tabs.truncate(index + 1);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        }
-        self.activate(self.active, window, cx);
-    }
 
     /// 切到某个 Markdown 标题：把源码光标移到那一行的行首。
     ///
@@ -1198,12 +1453,12 @@ impl Workspace {
     }
 
     /// 开合 Markdown 大纲面板。
+    ///
+    /// 只翻转**运行期视图模式**（`view_outline`，全局一份）：切到别的文件面板还在
+    /// （用户要的"切文件也保持"），重启回默认的收起状态——所以这里**不写会话**。
     fn toggle_outline(&mut self, cx: &mut Context<Self>) {
-        if let Some(doc) = self.active_doc_mut() {
-            doc.outline_open = !doc.outline_open;
-            self.persist_session();
-            cx.notify();
-        }
+        self.view_outline = !self.view_outline;
+        cx.notify();
     }
 
     /// 图片查看区的当帧矩形（事件换算用）。没有打开文档时给一片零区域：
@@ -1286,9 +1541,12 @@ impl Workspace {
                 .item(PopupMenuItem::new("新建文件").on_click(run(TreeCommand::NewFile)))
                 .item(PopupMenuItem::new("新建文件夹").on_click(run(TreeCommand::NewFolder)))
                 .separator()
+                // 「打开」那条去掉了：左键点文件树里的文件本来就是打开，菜单里再放一条
+                // 是重复（用户要求）。目录的展开 / 收起也仍然是左键一下的事。
                 .when(is_file, |this| {
-                    this.item(PopupMenuItem::new("打开").on_click(run(TreeCommand::Open)))
-                        .item(PopupMenuItem::new("复制完整路径").on_click(run(TreeCommand::CopyPath)))
+                    this.item(
+                        PopupMenuItem::new("复制完整路径").on_click(run(TreeCommand::CopyPath)),
+                    )
                 })
                 .item(PopupMenuItem::new("在资源管理器中显示").on_click(run(TreeCommand::Reveal)))
                 .separator()
@@ -1326,43 +1584,52 @@ impl Workspace {
     /// 写盘的唯一出口。`overwrite_external` 标记"用户已就冲突做过裁决"。
     ///
     /// 只读文档直接拒绝而不是静默丢弃：用户按下保存却什么都没发生是最糟的反馈。
+    ///
+    /// **性能**：这条路径上只允许整篇转码**一次**。转码的结果（刚写出去的那些字节）
+    /// 直接拿来当新的比对基线，绝不为了更新基线再编码一遍——历史上正是那第二遍
+    /// 让一次保存变成两遍整篇 GB18030 转码，用户看到的是"点保存卡死数秒"。
+    /// 相关的另一半在 `Cargo.toml`：`encoding_rs` 必须开 `fast-gb-hanzi-encode`。
     fn write_to_disk(&mut self, overwrite_external: bool, cx: &mut Context<Self>) {
-        let Some(doc) = self.active_doc_mut() else {
-            return;
-        };
-        if doc.snapshot.read_only {
-            self.status = Some(String::from("该文档是只读的，未写入磁盘"));
-            cx.notify();
-            return;
+        let index = self.active;
+        match self.tabs.get(index) {
+            Some(doc) if !doc.snapshot.read_only => {},
+            Some(_) => {
+                self.status = Some(String::from("该文档是只读的，未写入磁盘"));
+                cx.notify();
+                return;
+            },
+            None => return,
         }
 
-        let text = doc.input.read(cx).value().to_string();
+        let path = self.tabs[index].path.clone();
+        // `value()` 已经把整条 rope 拷成一份 String，别再 `.to_string()` 复制第二遍
+        // （4.8 MB 的小说上那是白花 0.9 ms 和 7 MB 内存流量）。
+        let text = self.tabs[index].input.read(cx).value();
         let written = if overwrite_external {
-            text_file::save_over(&doc.path, &doc.snapshot, &text)
+            text_file::save_over(&path, &self.tabs[index].snapshot, text.as_str())
         } else {
-            text_file::save(&doc.path, &doc.snapshot, &text)
+            text_file::save(&path, &self.tabs[index].snapshot, text.as_str())
         };
         match written {
-            Ok(()) => {
+            Ok(bytes) => {
                 // 更新基线并保留 BOM/CRLF 约定，后续保存与冲突检测都以新内容为准。
-                match doc.snapshot.rebase(&text) {
-                    Ok(()) => {
-                        doc.dirty = false;
-                        doc.conflict = false;
-                        doc.missing = false;
-                        self.status = Some(format!("已保存 {}", text_file::display_name(&doc.path)));
-                        self.error = None;
-                    },
-                    Err(error) => {
-                        self.status = Some(format!("已写入磁盘，但基线更新失败：{error}"));
-                    },
-                }
+                // 直接装**刚写出去的那份字节**：不重新编码，也不会因为"写盘成功但
+                // 再次编码失败"而出现"文件已改、基线没跟"的错位。
+                let doc = &mut self.tabs[index];
+                doc.snapshot.rebase_encoded(bytes);
+                doc.dirty = false;
+                doc.conflict = false;
+                doc.missing = false;
+                self.status = Some(format!("已保存 {}", text_file::display_name(&path)));
+                self.error = None;
             },
             Err(error) => {
                 if matches!(error, SaveError::Changed) {
                     // 冲突检测拦下了这次保存：把裁决出口摆出来，而不是只报一句错
                     // 让用户对着一个按不动的保存按钮发愣。
-                    doc.conflict = true;
+                    if let Some(doc) = self.tabs.get_mut(index) {
+                        doc.conflict = true;
+                    }
                 }
                 self.status = Some(format!("保存失败：{error}"));
             },
@@ -1447,6 +1714,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 先记下来：下面 `doc` 是可变的借用，不能再从 `self` 上读视图模式。
+        let view_preview = self.view_preview;
         let Some(doc) = self.tabs.get_mut(index) else {
             return;
         };
@@ -1464,6 +1733,11 @@ impl Workspace {
             // 位置莫名其妙的画面（几何的 `reset` 注释记了同一条）。
             doc.image_geometry.reset(doc.image.as_ref().and_then(image_dimensions));
         }
+        // SVG 的预览来自编辑缓冲（不是磁盘解码），这里先作废旧的光栅化结果；
+        // 若当前正显示预览面就立刻按新缓冲重画，否则等切到预览时再画。
+        if doc.kind == FileKind::Svg {
+            doc.svg_rev = 0;
+        }
         // `set_value` 刻意不发 `InputEvent::Change`，脏标记只能在这里手动清；组件库
         // 内部仍会刷新搜索面板的匹配区间（`replace_text` 里调了 `update_search`）。
         // 视野会回到文件开头：`scroll_to` 在组件库里是 crate 内可见，公开 API 没有
@@ -1473,6 +1747,9 @@ impl Workspace {
         // 和"每次改动"共用同一条路径，逻辑只有一份。
         let text_now = doc.input.read(cx).value();
         refresh_derived_layers(doc, text_now.as_ref(), cx);
+        if shows_preview(doc.kind, doc.preview, view_preview) {
+            refresh_svg_preview(doc, cx);
+        }
         cx.notify();
     }
 
@@ -1498,13 +1775,34 @@ impl Workspace {
     /// 切回源码面时把焦点交还编辑器：预览态下编辑器不参与渲染、焦点已回落到根
     /// 节点（见 `activate` 的注释），不还焦点的话切回来还得再点一下正文才能打字。
     /// 切到预览面没有可聚焦的目标，什么都不做。
+    ///
+    /// **翻的是运行期视图模式**（`view_preview`），不是这一个标签自己的状态：用户要求
+    /// "切到预览之后再切别的文件也还是预览"，而重启回默认（源码）。图片是唯一的例外，
+    /// 它翻自己那一面（`Document::preview`）——见 [`shows_preview`]。
+    ///
+    /// 视图模式**不进会话**，所以这里不再写盘（从前 `preview` 是每个标签的状态，
+    /// 改一次就落盘一次）。
     fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(doc) = self.active_doc_mut() else {
+        if self.active >= self.tabs.len() {
             return;
-        };
-        doc.preview = !doc.preview;
-        let preview = doc.preview;
-        let input = doc.input.clone();
+        }
+        if self.tabs[self.active].kind == FileKind::Image {
+            let doc = &mut self.tabs[self.active];
+            doc.preview = !doc.preview;
+        } else {
+            self.view_preview = !self.view_preview;
+        }
+        let preview = shows_preview(
+            self.tabs[self.active].kind,
+            self.tabs[self.active].preview,
+            self.view_preview,
+        );
+        // 切到 SVG 预览面时按**当前缓冲**光栅化：源码面里改过的内容在这里才追上
+        // （缓存按 `text_rev` 判新旧，没改过就不重复渲染）。
+        if preview {
+            refresh_svg_preview(&mut self.tabs[self.active], cx);
+        }
+        let input = self.tabs[self.active].input.clone();
         // 抓手平移层只活在源码面上，切面之后没人再更新 Ctrl 状态了——清掉，
         // 免得切回源码面时先挂着一层不该有的抓手（下一次鼠标移动也会自纠）。
         self.ctrl_down = false;
@@ -1512,7 +1810,6 @@ impl Workspace {
         if !preview {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
-        self.persist_session();
         cx.notify();
     }
 
@@ -1639,12 +1936,20 @@ impl Workspace {
 
     /// 某个字体槽位当前的顶置列表。
     ///
-    /// 两个槽位各有一份顶置名单：字体列表是两列独立的候选，顶置也该各管各的
+    /// 两个槽位各有一份顶置名单：字体列表按槽位切换，顶置也各管各的
     /// （用户不会因为把界面字体顶上去，顺便把编辑器字体那列也改了顺序）。
     fn font_pins(&self, slot: FontSlot) -> &[String] {
         match slot {
             FontSlot::Ui => &self.ui_font_pins,
             FontSlot::Editor => &self.editor_font_pins,
+        }
+    }
+
+    /// 切换设置面板里正在浏览的字体槽位（纯视图状态，不落盘）。
+    fn set_settings_font_slot(&mut self, slot: FontSlot, cx: &mut Context<Self>) {
+        if self.settings_font_slot != slot {
+            self.settings_font_slot = slot;
+            cx.notify();
         }
     }
 
@@ -1671,172 +1976,176 @@ impl Workspace {
     ///
     /// 每次改动立即写：设置面板里的改动本来就是低频的，攒着一起写只会多出
     /// "什么时候该写"这个状态（还要处理关窗时的收尾）。
+    /// 把两个字体槽位的选择与顶置项、字号倍率、自动换行写进设置文件。
+    ///
+    /// 每次改动立即写：设置面板里的改动本来就是低频的，攒着一起写只会多出
+    /// "什么时候该写"这个状态（还要处理关窗时的收尾）。
     fn save_settings(&self) {
         crate::settings::Settings {
             ui_font: Some(self.ui_font.to_string()),
             editor_font: Some(self.editor_font.to_string()),
             pinned_ui_fonts: self.ui_font_pins.clone(),
             pinned_editor_fonts: self.editor_font_pins.clone(),
+            font_scale: Some(self.font_scale),
+            word_wrap: Some(self.word_wrap),
         }
         .save();
     }
 
-    /// 设置面板（目前只有"字体管理"）。
+    /// 设置面板：外观（字号数轴 / 自动换行）与字体管理（两个槽位共用一个列表）。
     ///
     /// 用自绘的居中卡片 + 半透明遮罩，而不是组件库的 `Dialog` / `Settings`：后者带
-    /// 一整套按钮 / 侧栏导航的样式与状态机，对"两个下拉选字体"这种体量过重，而且
+    /// 一整套按钮 / 侧栏导航的样式与状态机，对这一版的两段设置体量过重，而且
     /// `Dialog` 的命令式宿主会多一层 `Entity`。这里直接由 `render` 在根上叠一层
     /// `deferred`（和两个右键菜单同一手法），点遮罩关、点卡片内不关。
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tokens = cx.theme();
         let card_bg = tokens.popover;
-        let list_bg = tokens.background;
-        let hairline = tokens.border;
         let muted = tokens.muted_foreground;
         let foreground = tokens.foreground;
         let hover_bg = tokens.list_hover;
-        let active_bg = tokens.tab_active;
-        let active_fg = tokens.tab_active_foreground;
-        // 过滤词：两个字体列表共用（一次搜索同时筛两项的候选）。
+        // 未选中的分段选项以外壳灰为底，与标签条 / 侧栏同色。
+        let shell_bg = crate::theme::shell_hsla();
+        // 过滤词只筛当前这一张字体列表。
         let query = self.font_filter.read(cx).value().trim().to_lowercase();
 
-        // 每个字体候选一行：名字用**候选字体本身**渲染，一眼看出长什么样。当前选中
-        // 的一行用水洗底色标出，点了就应用；行尾那颗图钉把常用字体顶到列表最前
-        // （顶置顺序跟设置一起落盘，见 `toggle_font_pin`）。
-        let font_list = |selected: &SharedString, apply: FontSlot| -> gpui::AnyElement {
-            let icon_family = SharedString::from(fonts::REQUIRED_FONT_FAMILY);
-            let pins = self.font_pins(apply);
-            let ordered = crate::settings::ordered(&self.font_catalog, pins);
-            let rows: Vec<gpui::AnyElement> = ordered
-                .into_iter()
-                .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
-                .take(400)
-                .map(|name| {
-                    let is_pinned = pins.iter().any(|pin| pin == name);
-                    let name = SharedString::from(name.to_owned());
-                    let clicked = name.clone();
-                    let toggled = name.clone();
-                    let is_selected = &name == selected;
-                    h_flex()
-                        .id(SharedString::from(format!("font:{apply:?}:{name}")))
-                        .h(px(30.0))
-                        .w_full()
-                        .min_w_0()
-                        .items_center()
-                        .gap(px(4.0))
-                        .pl(px(10.0))
-                        .pr(px(4.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .when(is_selected, |this| this.bg(active_bg))
-                        .when(!is_selected, |this| this.hover(move |this| this.bg(hover_bg)))
-                        .text_sm()
-                        .text_color(if is_selected { active_fg } else { foreground })
-                        // 名字按候选字体族渲染：选 `Microsoft YaHei UI` 就显示成雅黑，
-                        // 选 Maple 就是等宽。行高固定，不同字体的行也整齐。
-                        .font_family(name.clone())
-                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                        .when(is_selected, |this| {
-                            this.child(div().flex_shrink_0().text_color(active_fg).child("✓"))
-                        })
-                        // 图钉：顶置 / 取消顶置。它必须是**独立的可点区域**，所以
-                        // 先掐断冒泡，免得点图钉顺带把这一行的字体也应用了。
-                        //
-                        // 字族必须显式钉在 Maple：图钉是 Nerd Font 的私有使用区
-                        // 码点，而这一行的字族是**候选字体**，拿它渲染图钉多半是
-                        // 一个方框（文件树的图标列同理，见 `icons.rs`）。
-                        //
-                        // 钉住/没钉住用**同一个字形 + 不同颜色**区分，不换字形：
-                        // Nerd Font 里没有对应的"空心图钉"，硬凑一个别的符号反而
-                        // 认不出来。
-                        .child(
-                            h_flex()
-                                .id(SharedString::from(format!("font-pin:{apply:?}:{name}")))
-                                .w(px(20.0))
-                                .h(px(20.0))
-                                .flex_shrink_0()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.0))
-                                .font_family(icon_family.clone())
-                                .text_color(if is_pinned { active_fg } else { muted })
-                                .when(!is_pinned, |this| {
-                                    this.hover(move |this| this.text_color(foreground))
-                                })
-                                .cursor_pointer()
-                                .child(icons::ICON_PIN)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_font_pin(apply, toggled.to_string(), cx);
-                                })),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| match apply {
-                            FontSlot::Ui => this.set_ui_font(clicked.clone(), cx),
-                            FontSlot::Editor => this.set_editor_font(clicked.clone(), cx),
-                        }))
-                        .into_any_element()
-                })
-                .collect();
+        // 当前槽位的候选名（顶置在前、按过滤词筛过）。`Rc` 让行构建闭包按值捕获
+        // 同一份——`cx.processor` 的闭包是 `'static` 的，不能借用 `self` 的字段。
+        let slot = self.settings_font_slot;
+        let names = Rc::new(match slot {
+            FontSlot::Ui => font_choices(&self.font_catalog, &self.ui_font_pins, &query),
+            FontSlot::Editor => {
+                font_choices(&self.font_catalog, &self.editor_font_pins, &query)
+            },
+        });
+        let list = self.render_font_list(slot, names, cx);
 
-            let list = v_flex()
-                .id(SharedString::from(format!("font-list:{apply:?}")))
-                .w_full()
-                .h(px(168.0))
-                .min_h_0()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(hairline)
-                .bg(list_bg)
-                .p(px(4.0))
-                .children(rows);
-
-            // ⚠ **两个列表必须在不同的源码行上调用 `overflow_y_scrollbar`。**
-            //
-            // 组件库的 `Scrollable::new` 用 `ElementId::CodeLocation(*Location::caller())`
-            // ——也就是**调用点的源码位置**——当滚动状态的 key。同一个调用点渲染出
-            // 两份（这里正是如此：一个闭包被两个槽位各调一次），两份就共享同一个
-            // `ScrollHandle`，表现成"滚其中一个字体列表，另一个跟着一起滚"。
-            // 拆成两个 match 分支 = 两个源码位置 = 两份独立的滚动状态。
-            match apply {
-                FontSlot::Ui => list.overflow_y_scrollbar().into_any_element(),
-                FontSlot::Editor => list.overflow_y_scrollbar().into_any_element(),
-            }
+        // —— 版式 ——
+        //
+        // 这一版刻意做减法：没有小节标题、说明文字、卡片边框和分隔线，所有分组
+        // 只靠留白。字号是一条**数轴**：下面一条滑条、三个可点的刻度，拖到哪
+        // 界面就跟着缩放到哪。
+        let percent = (self.font_scale * 100.0).round() as i32;
+        let tick_color = muted;
+        let tick = |id: &'static str, label: &'static str, target: f32, center: bool, end: bool| {
+            h_flex()
+                .id(id)
+                .flex_1()
+                .when(center, |this| this.justify_center())
+                .when(end, |this| this.justify_end())
+                .when(!center && !end, |this| this.justify_start())
+                .cursor_pointer()
+                .text_xs()
+                .text_color(tick_color)
+                .hover(move |this| this.text_color(foreground))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.animate_font_scale(target, window, cx)
+                }))
+                .child(label)
         };
+        let scale_axis = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(px(10.0))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child("字号"),
+                    )
+                    .child(div().text_sm().text_color(muted).child(format!("{percent}%"))),
+            )
+            .child(Slider::new(&self.font_scale_slider).w_full())
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(tick("scale-tick:small", "小 75%", FONT_SCALE_SMALL, false, false))
+                    .child(tick("scale-tick:medium", "中 100%", FONT_SCALE_MEDIUM, true, false))
+                    .child(tick("scale-tick:large", "大 125%", FONT_SCALE_LARGE, false, true)),
+            );
 
-        // 一项设置：标题 + 当前值 + 候选列表。
-        let section = |title: &str, current: &SharedString, apply: FontSlot| -> gpui::AnyElement {
-            v_flex()
-                .w_full()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(title.to_string()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("当前：{current}")),
-                        ),
-                )
-                .child(font_list(current, apply))
-                .into_any_element()
-        };
+        // 自动换行：胶囊开关。开着时轨道变强调色、滑块靠右。
+        let wrap_switch = setting_switch(
+            SharedString::from("word-wrap"),
+            self.word_wrap,
+            cx,
+            cx.listener(|this, _, window, cx| this.toggle_word_wrap(window, cx)),
+        );
 
+        // 字体段的两个槽位做成标签页：一次只显示一张通栏列表。
+        let font_tabs = h_flex()
+            .items_center()
+            .gap(px(2.0))
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(shell_bg)
+            .child(segment_option(
+                SharedString::from("font-tab:ui"),
+                "界面 / 标题",
+                matches!(slot, FontSlot::Ui),
+                cx,
+                cx.listener(|this, _, _, cx| this.set_settings_font_slot(FontSlot::Ui, cx)),
+            ))
+            .child(segment_option(
+                SharedString::from("font-tab:editor"),
+                "编辑器 / 预览",
+                matches!(slot, FontSlot::Editor),
+                cx,
+                cx.listener(|this, _, _, cx| this.set_settings_font_slot(FontSlot::Editor, cx)),
+            ))
+            .into_any_element();
+
+        let wrap_row = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child("自动换行"),
+            )
+            .child(wrap_switch);
+
+        // 字体工具栏（标签 + 搜索）与列表。没有外框、没有标题；标签本身说明
+        // 这是哪一槽位，搜索框用一块外壳灰圆角底，不再画边框。
+        let font_area = v_flex()
+            .w_full()
+            .min_w_0()
+            .gap(px(10.0))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(font_tabs)
+                    .child(
+                        Input::new(&self.font_filter)
+                            .w(px(200.0))
+                            .min_w_0()
+                            .small()
+                            .appearance(false)
+                            .bg(shell_bg)
+                            .rounded(px(7.0)),
+                    ),
+            )
+            .child(list);
 
         let backdrop = div()
             .id("settings-backdrop")
             .absolute()
             .inset_0()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+            // 遮罩比之前淡一点（0.35 → 0.28）：面板本身是浅色卡片，
+            // 遮罩太重会让整屏发闷。
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.28))
             // 点遮罩关面板。`occlude` 让遮罩吃掉点击，下面的编辑器不会被动到。
             .occlude()
             .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
@@ -1846,35 +2155,39 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("settings-card")
-                    .w(px(520.0))
-                    // 高度上限要容得下"标题 + 三行说明 + 过滤框 + 两段字体列表"：
-                    // 两段各 168 的行高加上间距约 400，整体算下来要 ~580。原来的
-                    // 560 在只有一行说明时勉强够，加了两行说明就会把下面那段列表
-                    // 顶出卡片（卡片没有 `overflow_hidden`，溢出会画在圆角外面）。
-                    .max_h(px(640.0))
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_color(hairline)
+                    // 720：字体工具栏（标签 + 搜索）与长字体名需要这一档宽度。
+                    .w(px(720.0))
+                    .max_h(px(700.0))
+                    .rounded(px(14.0))
                     .bg(card_bg)
+                    // 只靠阴影分层，不画边框。
                     .shadow_lg()
-                    .p(px(16.0))
-                    .gap(px(14.0))
+                    .overflow_hidden()
                     // 点卡片内部不关：掐断冒泡，别让遮罩的 `on_click` 收到。
                     .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    // —— 标题条（没有分割线，靠下方留白） ——
                     .child(
                         h_flex()
                             .w_full()
                             .items_center()
                             .justify_between()
-                            .child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child("设置"))
+                            .px(px(24.0))
+                            .pt(px(18.0))
+                            .pb(px(2.0))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("设置"),
+                            )
                             .child(
                                 h_flex()
                                     .id("settings-close")
-                                    .w(px(24.0))
-                                    .h(px(24.0))
+                                    .w(px(28.0))
+                                    .h(px(28.0))
                                     .items_center()
                                     .justify_center()
-                                    .rounded(px(6.0))
+                                    .rounded(px(7.0))
                                     .cursor_pointer()
                                     .text_color(muted)
                                     .hover(move |this| this.bg(hover_bg).text_color(foreground))
@@ -1882,48 +2195,161 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
                             ),
                     )
-                    // 一句话说清三件事：改动立即生效、会被记住（用户报过"改了没
-                    // 记住"）、以及图钉是干什么的。
+                    // —— 正文：三个分组只用留白隔开，没有小节标题与边框 ——
                     .child(
                         v_flex()
-                            .gap(px(2.0))
-                            .text_xs()
-                            .text_color(muted)
-                            .child("字体管理 · 改动即时生效，并自动记住（重启后仍是这次选的）")
-                            .child("行尾的图钉把常用字体顶到列表最前；两列各有各的顶置顺序")
-                            .child("设置写在 %APPDATA%\\nebula-lite\\settings.json"),
-                    )
-                    .child(
-                        Input::new(&self.font_filter)
+                            .id("settings-body")
                             .w_full()
                             .min_w_0()
-                            .small()
-                            .rounded(px(6.0)),
-                    )
-                    .child(
-                        v_flex()
-                            // 不写 `flex_1`：卡片是内容撑高（只有 `max_h`），父级没有
-                            // 确定高度，`flex_1` + `min_h_0` 会把这一列塌成 0——两个列表
-                            // 就都看不见了（踩过）。两个列表各自是固定高度（见 `font_list`），
-                            // 所以这里按内容排布即可。
-                            .w_full()
-                            .min_w_0()
-                            .gap(px(16.0))
-                            .child(section("界面 / 标题字体", &self.ui_font, FontSlot::Ui))
-                            .child(section(
-                                "编辑器 / 预览字体",
-                                &self.editor_font,
-                                FontSlot::Editor,
-                            )),
+                            .gap(px(24.0))
+                            .px(px(24.0))
+                            .py(px(20.0))
+                            .child(scale_axis)
+                            .child(wrap_row)
+                            .child(font_area),
                     ),
             );
 
         deferred(backdrop).with_priority(2).into_any_element()
     }
 
-    /// 侧栏拖动的移动 / 松开层：一张覆盖整窗、无 hitbox 的 canvas，在 `paint` 里
-    /// 注册窗口级鼠标监听。见 `render` 里调用处的说明。
-    fn render_sidebar_drag_layer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 设置面板里的字体候选列表（虚拟化的 `uniform_list`）。
+    ///
+    /// **为什么必须虚拟化**：候选来自系统字体枚举（本机两百多个），从前两个列表
+    /// 一次建 400 行元素，而且每行都要用**它自己那副字体**塑形——等于首次打开设置
+    /// 面板时一口气加载几百个字体文件，用户报的"首次打开设置弹窗很卡"就是这笔开销。
+    /// 现在每帧只建可视区那十几行。
+    ///
+    /// 两个槽位各持一份滚动句柄，但**同一帧只渲染一个列表**（由设置面板顶部的
+    /// 分段标签切换）。`uniform_list` 的 id 与滚动状态里都带槽位，所以切换标签
+    /// 不会把另一个列表的滚动位置带过来。
+    fn render_font_list(
+        &self,
+        slot: FontSlot,
+        names: Rc<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let handle = match slot {
+            FontSlot::Ui => &self.font_scroll_ui,
+            FontSlot::Editor => &self.font_scroll_editor,
+        };
+        uniform_list(
+            SharedString::from(format!("font-list:{slot:?}")),
+            names.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                range.map(|index| this.render_font_row(slot, names.as_slice(), index, cx)).collect()
+            }),
+        )
+        // 高度必须显式给：`uniform_list` 自己就是滚动容器，而卡片是内容撑高的
+        // （没有确定高度的父级可借）。行高由 `render_font_row` 钉在 `FONT_ROW_HEIGHT`。
+        .h(px(FONT_LIST_HEIGHT))
+        .w_full()
+        .track_scroll(handle)
+        .into_any_element()
+    }
+
+    /// 字体列表里的一行：名字用**候选字体本身**渲染（一眼看出长什么样），当前选中的
+    /// 一行用水洗底色标出、点了就应用；行尾那颗图钉把常用字体顶到列表最前。
+    ///
+    /// 行高必须精确等于 [`FONT_ROW_HEIGHT`]：`uniform_list` 只测量渲染过的项、按统一
+    /// 高度排布其余项，行高不一致会让后面的行错位（文件树的行同理）。
+    fn render_font_row(
+        &self,
+        slot: FontSlot,
+        names: &[String],
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tokens = cx.theme();
+        let foreground = tokens.foreground;
+        let muted = tokens.muted_foreground;
+        let hover_bg = tokens.list_hover;
+        let active_bg = tokens.tab_active;
+        let accent = tokens.primary;
+        // 列表比缓存晚一帧（过滤词刚变过 / 字体被卸载）：补一个等高空行，不留空洞。
+        let Some(name) = names.get(index) else {
+            return div().h(px(FONT_ROW_HEIGHT)).w_full().into_any_element();
+        };
+        let is_pinned = self.font_pins(slot).iter().any(|pin| pin == name);
+        let selected = match slot {
+            FontSlot::Ui => &self.ui_font,
+            FontSlot::Editor => &self.editor_font,
+        };
+        let name = SharedString::from(name.clone());
+        let is_selected = &name == selected;
+        let clicked = name.clone();
+        let toggled = name.clone();
+        // 图钉是 Nerd Font 的私有使用区码点，而这一行的字族是**候选字体**，拿它渲染
+        // 多半是一个方框——所以图钉那一格显式钉在 Maple 上（文件树的图标列同理）。
+        let icon_family = SharedString::from(fonts::REQUIRED_FONT_FAMILY);
+
+        h_flex()
+            .id(SharedString::from(format!("font:{slot:?}:{index}")))
+            .h(px(FONT_ROW_HEIGHT))
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(12.0))
+            .pr(px(6.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(is_selected, |this| this.bg(active_bg))
+            .when(!is_selected, |this| this.hover(move |this| this.bg(hover_bg)))
+            .text_sm()
+            .text_color(if is_selected { accent } else { foreground })
+            // 名字按候选字体族渲染：选 `Microsoft YaHei UI` 就显示成雅黑，选 Maple 就是
+            // 等宽。行高固定，不同字体的行也整齐。
+            .font_family(name.clone())
+            .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+            .when(is_selected, |this| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(accent)
+                        .child(Icon::new(IconName::Check).small()),
+                )
+            })
+            // 图钉：顶置 / 取消顶置。它必须是**独立的可点区域**，所以先掐断冒泡，
+            // 免得点图钉顺带把这一行的字体也应用了。
+            //
+            // 钉住 / 没钉住用**同一个字形 + 不同颜色**区分，不换字形：Nerd Font 里没有
+            // 对应的"空心图钉"，硬凑一个别的符号反而认不出来。
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("font-pin:{slot:?}:{index}")))
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .font_family(icon_family)
+                    .text_color(if is_pinned { accent } else { muted })
+                    .when(!is_pinned, |this| {
+                        this.hover(move |this| this.bg(hover_bg).text_color(foreground))
+                    })
+                    .cursor_pointer()
+                    .child(icons::ICON_PIN)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_font_pin(slot, toggled.to_string(), cx);
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| match slot {
+                FontSlot::Ui => this.set_ui_font(clicked.clone(), cx),
+                FontSlot::Editor => this.set_editor_font(clicked.clone(), cx),
+            }))
+            .into_any_element()
+    }
+
+    /// 两条分割线（侧栏、大纲面板）拖动的移动 / 松开层：一张覆盖整窗、无 hitbox 的
+    /// canvas，在 `paint` 里注册**窗口级**鼠标监听。见 `render` 里调用处的说明。
+    ///
+    /// 两个拖动共用这一层：它们的"按下"发生在各自的抓手元素上（那里立旗），而移动与
+    /// 松开必须靠窗口级事件——指针拖出抓手范围之后元素级的 `on_mouse_move` 就收不到了。
+    /// 指针落在哪条线上不影响判断：拖动期间只有一条旗子会立着。
+    fn render_drag_layer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let workspace = cx.entity().downgrade();
         canvas(
             |bounds, _window, _cx| bounds,
@@ -1933,8 +2359,11 @@ impl Workspace {
                     move |event: &MouseMoveEvent, _, _, cx| {
                         if let Some(workspace) = workspace.upgrade() {
                             workspace.update(cx, |this, cx| {
+                                let x = f32::from(event.position.x);
                                 if this.sidebar_dragging {
-                                    this.resize_sidebar(f32::from(event.position.x), cx);
+                                    this.resize_sidebar(x, cx);
+                                } else if this.outline_dragging {
+                                    this.resize_outline(x, cx);
                                 }
                             });
                         }
@@ -1948,8 +2377,9 @@ impl Workspace {
                         }
                         if let Some(workspace) = workspace.upgrade() {
                             workspace.update(cx, |this, cx| {
-                                if this.sidebar_dragging {
+                                if this.sidebar_dragging || this.outline_dragging {
                                     this.sidebar_dragging = false;
+                                    this.outline_dragging = false;
                                     cx.notify();
                                 }
                             });
@@ -2127,6 +2557,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 拖动大纲分割线时，把鼠标的 x 位置换算成大纲面板宽度（钳进合法区间）。
+    ///
+    /// 面板在内容区**左端**，所以宽度 = 鼠标 x − 内容区左缘；内容区左缘就是侧栏右缘
+    /// （侧栏收起时是窗口左缘）。与侧栏那一条同一套做法。
+    fn resize_outline(&mut self, x: f32, cx: &mut Context<Self>) {
+        let content_left = if self.sidebar_open { self.sidebar_width } else { 0.0 };
+        let width = (x - content_left).clamp(MIN_OUTLINE_WIDTH, MAX_OUTLINE_WIDTH);
+        if (width - self.outline_width).abs() < 0.5 {
+            return;
+        }
+        self.outline_width = width;
+        self.persist_session_throttled();
+        cx.notify();
+    }
+
     /// 侧栏文件树。
     ///
     /// 两处性能设计，都照抄 Pebrel：
@@ -2283,9 +2728,16 @@ impl Workspace {
         } else {
             icons::file_type_icon(&row.name)
         };
-        let color = if is_selected || row.is_dir { foreground } else { muted };
+        // 过滤态下的文件是**结果本身**，字色要和目录一样读得清；平时文件名字色
+        // 略淡，让目录层级先跳出来。
+        let color = if is_selected || row.is_dir || filtering { foreground } else { muted };
         let depth = row.depth;
         let name = row.name.clone();
+        // 内容过滤命中的片段与次数：一段灰字给出"为什么这个文件命中"，一条结果
+        // 只占一行，不另起子行。
+        let snippet = row.snippet.clone();
+        let hits = row.hits;
+        let name_max = (self.sidebar_width * 0.55).max(90.0);
         // 这一行是否正在被就地重命名：是就拿输入框换掉名字标签（新建 / 重命名共用）。
         let is_renaming = self.renaming.as_ref().is_some_and(|r| r.path == path);
         let menu_path = path.clone();
@@ -2365,7 +2817,41 @@ impl Workspace {
                 }
             })
             .when(!is_renaming, |this| {
-                this.child(div().flex_1().min_w_0().truncate().child(name))
+                this.child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_shrink_1()
+                                .min_w_0()
+                                .max_w(px(name_max))
+                                .truncate()
+                                .child(name),
+                        )
+                        .when_some(snippet, |this, snippet| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(snippet),
+                            )
+                        })
+                        .when(hits > 1, |this| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{hits} 处")),
+                            )
+                        }),
+                )
             })
             .into_any_element()
     }
@@ -2521,14 +3007,19 @@ impl Workspace {
         let missing = doc.missing;
         let dirty = doc.dirty;
         let read_only = doc.snapshot.read_only;
-        let preview = doc.preview;
+        // 面与大纲都要按**当前实际显示**的状态给按钮文案：面来自运行期视图模式
+        // （图片除外，见 `shows_preview`），大纲来自 `view_outline`。
+        let preview = shows_preview(doc.kind, doc.preview, self.view_preview);
+        let outline_open = self.view_outline;
+        // 有没有预览面（图片 / Markdown）决定「源码 / 预览」那颗药丸出不出来。
         let has_preview = doc.kind.has_preview();
-        let outline_open = doc.outline_open;
         // 大纲表是缓存（`Document::headings`，由 `refresh_derived_layers` 维护）：
         // 从前这里每帧都把整条 rope 拷成 String、再扫一遍标题，只为判断按钮要不要出现。
         let has_headings = doc.kind == FileKind::Markdown && !doc.headings.is_empty();
+        // 图片与 SVG 共用同一套缩放/平移查看器，复位药丸对两者都出。
         let reset_image =
-            doc.kind == FileKind::Image && doc.image_geometry.zoom() != 1.0;
+            matches!(doc.kind, FileKind::Image | FileKind::Svg)
+                && doc.image_geometry.zoom() != 1.0;
         let restart = crate::theme::shell_hsla();
 
         h_flex()
@@ -2646,8 +3137,10 @@ impl Workspace {
                 .into_any_element();
         };
 
-        let preview = doc.preview;
-        let outline_open = doc.outline_open;
+        // 面与大纲都按**当前实际显示**的状态渲染：面来自运行期视图模式（图片除外，
+        // 见 [`shows_preview`]），大纲来自 `view_outline`。
+        let preview = shows_preview(doc.kind, doc.preview, self.view_preview);
+        let outline_open = self.view_outline;
         // 大纲只对 Markdown 有意义（解析的是 ATX 标题），而 `headings` 就是缓存的那份
         // 标题表——非 Markdown 的文档它一直是空的，面板据此出现。
         //
@@ -2657,15 +3150,28 @@ impl Workspace {
         let has_headings = !headings.is_empty();
 
         let body = if preview {
-            // Markdown 预览要渲染编辑缓冲的当前内容（而不是磁盘上的那份），
-            // 否则"改几个字再切预览"看不到改动。
-            let markdown = (doc.kind == FileKind::Markdown).then(|| doc.input.read(cx).value());
+            // 富文本预览（Markdown / HTML）要渲染编辑缓冲的当前内容（而不是磁盘上的
+            // 那份），否则"改几个字再切预览"看不到改动。HTML 先把 `<head>` 整段去掉：
+            // 组件库的阅读模式不认元数据，却会把 `<title>` 的文字当正文显示在顶部。
+            let rich = match doc.kind {
+                FileKind::Markdown => Some(doc.input.read(cx).value()),
+                FileKind::Html => {
+                    let source = doc.input.read(cx).value();
+                    Some(html_preview_source(source.as_ref()).into())
+                },
+                _ => None,
+            };
+            let copied_code = self
+                .copied_code
+                .filter(|(_, at)| at.elapsed() < COPIED_CODE_FEEDBACK)
+                .map(|(key, _)| key);
             render_preview(
                 doc,
-                markdown,
+                rich,
                 muted,
                 self.font_size,
                 self.editor_font.clone(),
+                copied_code,
                 cx,
             )
             .into_any_element()
@@ -2689,21 +3195,46 @@ impl Workspace {
                 .into_any_element()
         };
 
-        // 大纲面板：只有开了面板、且文档里有标题时才占位置。与正文并排，
-        // 面板自身固定宽度，正文拿剩余宽度。
+        // 大纲面板：只有开了面板（运行期视图模式）、且文档里有标题时才占位置。与正文
+        // 并排，面板宽度由用户拖它右缘的分割线定（`outline_width`），正文拿剩余宽度。
         //
         // 高度必须显式给全（`h_full`）：`h_flex` 的行高由内容决定，不给高度的
         // 话正文那一列会按内容收缩，编辑器里的 `h_full` 解析到不定高度后塌成
         // 一行、再被横向 flex 居中——表现成"正文只剩第 1 行飘在中间"。
         let content_row = if outline_open && has_headings {
             h_flex()
+                // 分割线是绝对定位的，锚点在这一行上。
+                .relative()
                 .flex_1()
                 .w_full()
                 .h_full()
                 .min_h_0()
                 .min_w_0()
-                .child(render_outline(headings, cx))
+                .child(render_outline(headings, self.outline_width, cx))
                 .child(v_flex().flex_1().h_full().min_w_0().min_h_0().child(body))
+                // 拖动分割线：叠在面板与正文的交界上（绝对定位，不占布局宽度）。抓手是
+                // 个真交互元素（`occlude` + `on_mouse_down` 立起拖动标志、并给左右拉伸
+                // 光标），移动与松开由根上那张全窗 canvas 的窗口级监听处理——与侧栏那条
+                // 同一套（见 `render_drag_layer`）。视觉上那 1px 线由面板自己的
+                // `border_r_1` 画，这里只做抓手。
+                .child(
+                    div()
+                        .id("outline-divider")
+                        .absolute()
+                        .top_0()
+                        .left(px(self.outline_width - RESIZE_HANDLE_WIDTH))
+                        .h_full()
+                        .w(px(RESIZE_HANDLE_WIDTH * 2.0))
+                        .cursor_col_resize()
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.outline_dragging = true;
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .into_any_element()
         } else {
             body
@@ -3027,6 +3558,81 @@ fn render_source(
     container.into_any_element()
 }
 
+/// 设置面板里的分段选项（字体槽位两页）。
+///
+/// 选中项浮在白色底上、未选中项透明——比"每个选项各画一圈描边"安静得多，
+/// 也是 macOS 分段控件的观感。
+fn segment_option<F>(
+    id: SharedString,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &gpui::App,
+    on_click: F,
+) -> gpui::AnyElement
+where
+    F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+{
+    let tokens = cx.theme();
+    let foreground = tokens.foreground;
+    let muted = tokens.muted_foreground;
+    let card_bg = tokens.popover;
+
+    div()
+        .id(id)
+        .h(px(26.0))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .text_xs()
+        .font_weight(if selected {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if selected { foreground } else { muted })
+        .when(selected, |this| this.bg(card_bg))
+        .when(!selected, |this| {
+            this.hover(move |this| this.text_color(foreground))
+        })
+        .on_click(on_click)
+        .child(label.into())
+        .into_any_element()
+}
+
+/// 设置面板里的开关（自动换行）。macOS 式的胶囊轨道 + 圆形滑块。
+fn setting_switch<F>(id: SharedString, on: bool, cx: &gpui::App, on_click: F) -> gpui::AnyElement
+where
+    F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+{
+    let tokens = cx.theme();
+    let on_bg = tokens.primary;
+    let on_hover_bg = tokens.primary_hover;
+    let off_bg = tokens.switch;
+    let hover_bg = tokens.list_hover;
+    let thumb = tokens.switch_thumb;
+
+    h_flex()
+        .id(id)
+        .w(px(36.0))
+        .h(px(20.0))
+        .p(px(2.0))
+        .items_center()
+        .rounded(px(10.0))
+        .bg(if on { on_bg } else { off_bg })
+        .cursor_pointer()
+        .hover(move |this| {
+            this.bg(if on { on_hover_bg } else { hover_bg })
+        })
+        .when(on, |this| this.justify_end())
+        .when(!on, |this| this.justify_start())
+        .child(div().size(px(16.0)).rounded(px(8.0)).bg(thumb))
+        .on_click(on_click)
+        .into_any_element()
+}
+
 /// 纸面上的小按钮。
 ///
 /// 刻意不用组件库的 `Button`：gpui-component 0.5.2 重构按钮颜色推导时把
@@ -3061,10 +3667,99 @@ fn pill(
         .child(label.into())
 }
 
-/// 预览面：图片走可缩放/平移的 canvas，Markdown 走组件库的富文本渲染器。
+/// Markdown 预览代码块右上角的复制按钮。
 ///
-/// Markdown 的 `image_base` 指向文档所在目录，相对路径图片（`![](img/x.png)`）
-/// 才解析得到；网络图片走 gpui 的 HTTP 客户端（见 `main.rs` 的 `set_http_client`）。
+/// 点击把整块代码写进剪贴板；`copied` 为真时显示对勾，由工作区的
+/// `copied_code` 状态驱动，[`COPIED_CODE_FEEDBACK`] 后自动复原。
+fn code_copy_button(
+    key: usize,
+    code: SharedString,
+    copied: bool,
+    workspace: gpui::WeakEntity<Workspace>,
+    cx: &mut gpui::App,
+) -> gpui::AnyElement {
+    let tokens = cx.theme();
+    let muted = tokens.muted_foreground;
+    let hover_bg = tokens.list_hover;
+    let accent = tokens.primary;
+
+    h_flex()
+        .id(("copy-code", key))
+        .w(px(22.0))
+        .h(px(22.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.0))
+        .cursor_pointer()
+        .text_color(if copied { accent } else { muted })
+        .hover(move |this| this.bg(hover_bg).text_color(accent))
+        .on_click(move |_, _, cx| {
+            // 别让这次点击被预览面的文本选择层接走（否则会顺带清掉选区）。
+            cx.stop_propagation();
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            workspace
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((key, std::time::Instant::now()));
+                    cx.notify();
+                })
+                .ok();
+            let workspace = workspace.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(COPIED_CODE_FEEDBACK).await;
+                workspace
+                    .update(cx, |this, cx| {
+                        if this.copied_code.is_some_and(|(copied, _)| copied == key) {
+                            this.copied_code = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            })
+            .detach();
+        })
+        .child(if copied {
+            Icon::new(IconName::Check).small().into_any_element()
+        } else {
+            Icon::new(IconName::Copy).small().into_any_element()
+        })
+        .into_any_element()
+}
+
+/// HTML 预览前去掉 `<head>…</head>`：阅读模式不认元数据，却会把 `<title>`
+/// 的文字当正文渲染，看起来像文档开头多了一行。大小写不敏感；找不到完整的
+/// `<head>` 就原样返回（不猜结构，坏 HTML 交给解析器自己容错）。
+fn html_preview_source(source: &str) -> String {
+    let lower = source.to_ascii_lowercase();
+    let Some(head_start) = lower.find("<head") else {
+        return source.to_owned();
+    };
+    let Some(open_end) = lower[head_start..].find('>').map(|offset| head_start + offset + 1)
+    else {
+        return source.to_owned();
+    };
+    let Some(close_start) = lower[open_end..].find("</head").map(|offset| open_end + offset)
+    else {
+        return source.to_owned();
+    };
+    let close_end = lower[close_start..]
+        .find('>')
+        .map(|offset| close_start + offset + 1)
+        .unwrap_or(lower.len());
+    let mut preview = String::with_capacity(source.len() - (close_end - head_start));
+    preview.push_str(&source[..head_start]);
+    preview.push_str(&source[close_end..]);
+    preview
+}
+
+/// 预览面：图片 / SVG 走可缩放、平移的 canvas，Markdown / HTML 走组件库的富文本渲染器。
+///
+/// Markdown / HTML 的 `image_base` 指向文档所在目录，相对路径图片
+/// （`![](img/x.png)`）才解析得到；网络图片走 gpui 的 HTTP 客户端
+/// （见 `main.rs` 的 `set_http_client`）。
+///
+/// HTML 用的是 `TextView::html` 的**阅读模式**：标题 / 段落 / 列表 / 表格 / 图片
+/// 会显示，`<style>` 与 `<script>` 被忽略，CSS 和 JS 都不执行——这不是浏览器。
 ///
 /// 图片为什么要用 `canvas` 而不是 `img`：`img` 只会按 `object_fit` 缩放，无法
 /// 在"同一个元素里"做围绕指针的缩放与拖拽平移。canvas 的 paint 能拿到当帧
@@ -3072,10 +3767,11 @@ fn pill(
 /// 就是这条路（`gpui_shell/doc_tabs.rs`）。
 fn render_preview(
     doc: &Document,
-    markdown: Option<SharedString>,
+    rich: Option<SharedString>,
     muted: gpui::Hsla,
     font_size: f32,
     font_family: SharedString,
+    copied_code: Option<usize>,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     match (doc.kind, doc.image.as_ref()) {
@@ -3083,7 +3779,11 @@ fn render_preview(
             render_zoomable_image(doc, image.clone(), muted, cx).into_any_element()
         },
         (FileKind::Image, None) => note_panel("图片无法解码", muted),
-        (FileKind::Markdown, _) => {
+        (FileKind::Svg, Some(image)) => {
+            render_zoomable_image(doc, image.clone(), muted, cx).into_any_element()
+        },
+        (FileKind::Svg, None) => note_panel("SVG 无法渲染", muted),
+        (FileKind::Markdown | FileKind::Html, _) => {
             // 预览的**样式**是这一版的重点。组件库的 `TextView` 解析上其实够用
             // （标题 / 列表 / 表格 / 引用 / 任务框 / 围栏代码 / 行内代码都有），
             // 缺的是一套像样的默认样式：默认的段落间距、标题梯度、代码块与表格的
@@ -3094,8 +3794,8 @@ fn render_preview(
             //   **全局高亮主题**（也就是 Notepad3 那套按语言的配色），所以预览里
             //   的代码块跟源码面同源；
             // - 行内代码：淡灰底、不加边框——底色已经够区分了；
-            // - 表格：外边框 + 单元格内边距，宽度不够时**横向滚动**，而不是把整个
-            //   内容区撑宽（撑宽会把标签条右端的按钮挤出窗口，踩过）；
+            // - 表格：外边框 + 单元格内边距，**单元格内自动换行**（列宽随窗口
+            //   收缩，内容始终留在格子里，见下面 `table` 那段的注释）；
             // - 正文局限在一条**阅读栏宽**（`MARKDOWN_COLUMN_WIDTH`）里并居中：
             //   满屏宽的一行太长，读的时候眼睛回行会串行——"舒适"主要来自这一条。
             let hairline = cx.theme().border;
@@ -3113,21 +3813,41 @@ fn render_preview(
                     .border_1()
                     .border_color(hairline)
                     .rounded(px(8.0))
-                    .p(px(12.0));
+                    // 内边距改由组件库按"有没有头部"分别给：头部（语言名 +
+                    // 复制按钮）要横向铺满、贴着圆角，不能落在 12px 内边距里。
+                    .overflow_hidden();
                 probe.style().clone()
             };
-            let table = {
-                let mut probe = div()
-                    .id("md-table-probe")
-                    .border_1()
-                    .border_color(hairline)
-                    .rounded(px(8.0))
-                    // 宽度不够时让表格**自己横向滚**，而不是把内容区撑宽。
-                    .overflow_x_scroll();
-                probe.style().clone()
-            };
+            // 表格：**不要**在这里写 `overflow_x_scroll()`，也**不要**在这里画边框。
+            //
+            // 组件库按 `style.table` 的横向 overflow 分两条完全不同的排版路径
+            // （`text/node.rs::render_table`）：
+            //
+            // - `Overflow::Scroll` → `render_scroll_table`：横向滚动、不换行的
+            //   "电子表格"语义。
+            // - 其它（默认）→ `render_wrap_table`：列宽随窗口收缩、单元格内换行。
+            //
+            // 用户要的是后者（"表格里的字要自动换行、别跑出表格外"）。之前这里开着
+            // scroll 模式，于是窄窗口下整张表向右溢出、还被滚出去够不着。
+            //
+            // **不写** overflow 即可：`StyleRefinement` 的该字段是 `None`，组件库
+            // `matches!(…, Some(Overflow::Scroll))` 不成立，走换行那条。
+            //
+            // 边框同理：`render_wrap_table` 自己已经在表格上画了 `border_1` +
+            // `rounded(theme.radius)` + `overflow_hidden`。这里再写一遍会叠成双层
+            // （实测边框变粗发灰）；而把 `border_color` 设成透明更糟——`StyleRefinement`
+            // 里"只设颜色不设宽度"会把组件库那条边框**染成透明**，等于没有边框。
+            // 所以这个 refinement 留空。
+            let table = { div().id("md-table-probe").style().clone() };
             let table_cell = {
-                let mut probe = div().px(px(10.0)).py(px(6.0)).border_color(hairline);
+                let mut probe = div()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    // 单元格内的文本要能断行（默认真就是 `WhiteSpace::Normal`，
+                    // 这里显式写一遍是为了钉住它：组件库的列宽补丁按实测文本宽度
+                    // 分配 basis，剩下的空间靠 shrink + 换行消化，一旦这里被改成
+                    // `Nowrap`，长内容会直接顶出右边框）。
+                    .whitespace_normal();
                 probe.style().clone()
             };
 
@@ -3148,6 +3868,11 @@ fn render_preview(
                 })),
                 paragraph_gap: gpui::rems(0.9),
                 code_block,
+                // 围栏写什么语言就用那个语言的 Notepad3 配色；不写语言的块
+                // 回落纯文本黑。缓存见 `theme::code_block_highlight_theme`。
+                code_block_theme: Some(Arc::new(
+                    |language: Option<&str>| crate::theme::code_block_highlight_theme(language),
+                )),
                 table,
                 table_cell,
                 inline_code: gpui::HighlightStyle {
@@ -3172,10 +3897,16 @@ fn render_preview(
                     div()
                         .flex()
                         .w_full()
+                        .min_w_0()
                         .justify_center()
                         .child(
                             v_flex()
                                 .w_full()
+                                // `min_w_0` 不能省：这一列里放着表格，表格的列有
+                                // 各自的最小宽度（min-content）。不把这一层的最小
+                                // 宽度放开，下面算出的"收进容器"就失效——整列会被
+                                // 表格的最小宽度撑宽，右端溢出、最后一列被切掉。
+                                .min_w_0()
                                 .max_w(px(MARKDOWN_COLUMN_WIDTH))
                                 .px(px(32.0))
                                 .py(px(28.0))
@@ -3185,13 +3916,39 @@ fn render_preview(
                                 // 就换一种字"。代码块另读全局 `mono_font_family`
                                 // （`set_editor_font` 一并写入）。
                                 .font_family(font_family)
-                                .child(
-                                    TextView::markdown(
-                                        "md-preview",
-                                        markdown.unwrap_or_default(),
-                                    )
-                                    .style(style),
-                                ),
+                                .child({
+                                    let source = rich.unwrap_or_default();
+                                    let view = if doc.kind == FileKind::Markdown {
+                                        TextView::markdown("md-preview", source)
+                                    } else {
+                                        TextView::html("html-preview", source)
+                                    };
+                                    let workspace = cx.entity().downgrade();
+                                    view.style(style)
+                                        // 代码块右上角的复制按钮。`copied_code`
+                                        // 是这一帧的"刚复制过"标记，点击后由
+                                        // 工作区状态 + 定时器切到对勾再复原。
+                                        .code_block_actions(move |code_block, _, cx| {
+                                            let key = code_block.key();
+                                            code_copy_button(
+                                                key,
+                                                code_block.code(),
+                                                copied_code == Some(key),
+                                                workspace.clone(),
+                                                cx,
+                                            )
+                                        })
+                                        // 预览面的文字要能选中、能 `Ctrl+C`。组件库的
+                                        // `TextView` 默认 `selectable: false`
+                                        // （见 `text_view.rs::new`），不显式打开就完全
+                                        // 没有选中的命中区——用户报的"预览里选不了字"
+                                        // 就是这个默认值。
+                                        //
+                                        // `SelectionFormat::Plain`（默认）复制的是渲染后
+                                        // 的文字，不是 Markdown 源码；在预览里复制一段
+                                        // 标题得到"标题"而不是"# 标题"，这才是想要的。
+                                        .selectable(true)
+                                }),
                         ),
                 )
                 .into_any_element()
@@ -3252,6 +4009,10 @@ fn render_zoomable_image(
         .id("image-view")
         .flex_1()
         .w_full()
+        // 容器里只有绝对定位的 canvas，自然高度是 0；不写 `h_full` 的话它不会
+        // 从父级拿到剩余高度，图片就画在一张 0 高的画布上（实测 canvas bounds
+        // 高度为 0，预览整块空白）。`flex_1` 不够：父级不是每个路径上都是 flex。
+        .h_full()
         .min_w_0()
         .min_h_0()
         .relative()
@@ -3376,7 +4137,15 @@ fn bounds_to_area(bounds: Bounds<Pixels>) -> Area {
 ///
 /// 层级用左缩进表达，不做折叠——一份文档的标题通常一屏就能看完，折叠交互
 /// （要维护"哪些被折叠"的状态）在这里不划算。`level` 只用于缩进。
-fn render_outline(headings: &[outline::Heading], cx: &mut Context<Workspace>) -> impl IntoElement {
+///
+/// 面板顶部**不再有那一条「大纲」标题条**（用户要求去掉：它只是一行死标签，没有信息量，
+/// 还白占一行高度）。宽度由调用侧传入——用户拖右缘那条分割线改它（`outline_width`），
+/// 右缘的 1px 线就是抓手要抓的那条线。
+fn render_outline(
+    headings: &[outline::Heading],
+    width: f32,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let tokens = cx.theme();
     let hairline = tokens.border;
     let foreground = tokens.foreground;
@@ -3415,24 +4184,12 @@ fn render_outline(headings: &[outline::Heading], cx: &mut Context<Workspace>) ->
 
     v_flex()
         .id("outline-panel")
-        .w(px(OUTLINE_WIDTH))
+        .w(px(width))
         .h_full()
         .flex_shrink_0()
         .min_h_0()
         .border_r_1()
         .border_color(hairline)
-        .child(
-            h_flex()
-                .h(px(HEADER_HEIGHT))
-                .flex_shrink_0()
-                .items_center()
-                .px(px(12.0))
-                .border_b_1()
-                .border_color(hairline)
-                .text_sm()
-                .text_color(muted)
-                .child("大纲"),
-        )
         .child(
             div()
                 .flex_1()
@@ -3464,6 +4221,11 @@ impl Render for Workspace {
         // 预览里的宽表格会把内容区撑得比窗口还宽，标签条右端的按钮直接被窗口裁掉。
         // 这是 Pebrel 在 `Scrollable` 上记录过的同一类陷阱。侧栏宽度可变（拖动
         // 分割线），所以这一条要跟着 `sidebar_width` 走。
+        //
+        // `viewport_size()` 是**逻辑像素**（与 `scale_factor()` 同一套单位），与
+        // `sidebar_width` 相减是对的——别被"看着像物理像素"骗了：在 125% 缩放下
+        // 逻辑宽 = 物理宽 ÷ 1.25，而 DPI 不感知的抓图工具拿到的窗口矩形会被系统
+        // 按 0.8 虚拟化，于是同一块区域在两处量出来的数字不一样（踩过这个坑）。
         let sidebar = if self.sidebar_open { self.sidebar_width } else { 0.0 };
         let content_width = (window.viewport_size().width - px(sidebar)).max(px(160.0));
         // 自绘标题栏在顶，工作区（文件树 | 内容区）占满其余高度。此前没有这一行，
@@ -3506,6 +4268,11 @@ impl Render for Workspace {
                     .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| {
                         this.reset_font_size(cx)
                     }))
+                    // 自动换行：`Alt+Z`（窗口级绑定，见 `main.rs`）。它改的是所有标签的
+                    // 编辑器，所以必须是工作区级动作，不能挂在某个编辑器上。
+                    .on_action(cx.listener(|this, _: &ToggleWordWrap, window, cx| {
+                        this.toggle_word_wrap(window, cx)
+                    }))
                     // 「打开目录」也走窗口级绑定（`Ctrl+Shift+O`），与侧栏按钮、
                     // 空态按钮同源。见 `main.rs` 的绑定与 `open_folder`。
                     .on_action(cx.listener(|this, _: &OpenFolder, window, cx| {
@@ -3547,12 +4314,12 @@ impl Render for Workspace {
                         )
                     }),
             )
-            // 侧栏拖动的移动/松开：根上一张覆盖整窗的 canvas 注册**窗口级**鼠标监听，
-            // 拖拽期间指针跑到编辑器上也照样收得到（`on_mouse_move` 挂在元素上时只在
-            // 指针悬停该元素触发，编辑器一盖住就丢事件）。canvas 没有 hitbox，只监听、
-            // 不挡下面任何交互；这正是组件库 `ResizeHandle` 的机制
-            // （`resizable/panel.rs` 的 `ResizePanelGroupElement::paint`）。
-            .child(self.render_sidebar_drag_layer(cx))
+            // 两条分割线（侧栏 / 大纲面板）拖动的移动与松开：根上一张覆盖整窗的 canvas
+            // 注册**窗口级**鼠标监听，拖拽期间指针跑到编辑器上也照样收得到
+            // （`on_mouse_move` 挂在元素上时只在指针悬停该元素时触发，编辑器一盖住就丢
+            // 事件）。canvas 没有 hitbox，只监听、不挡下面任何交互；这正是组件库
+            // `ResizeHandle` 的机制（`resizable/panel.rs` 的 `ResizePanelGroupElement::paint`）。
+            .child(self.render_drag_layer(cx))
             // 标签右键菜单 / 文件树右键菜单：各唯一一份，挂在工作区根上。画在最后
             // （`deferred` 保证盖在所有内容之上），锚点是右键时的鼠标位置。菜单开着
             // 时不能挂在那一行元素的子孙树上——理由见 `TabMenu` 的注释。
@@ -3560,6 +4327,15 @@ impl Render for Workspace {
             .when_some(self.render_tree_menu(), |this, menu| this.child(menu))
             // 设置面板：叠在最上层（比两个菜单还高一层），开着时吃掉所有点击。
             .when(self.settings_open, |this| this.child(self.render_settings(cx)))
+            // **组件库的对话框层**。`Root::render` 自己**不**挂这一层
+            // （`root.rs` 只渲染 `view` / tooltip / 原生菜单），不在这里挂上，任何
+            // `window.open_dialog` / `open_alert_dialog` 都只会往 `Root::active_dialogs`
+            // 里塞一条记录而**永远不显示**——文件树右键菜单的「删除」按钮就是这样一直
+            // 什么都不做的（它弹的是确认对话框）。层本身自带整窗遮罩与 `occlude`，
+            // 所以用 `deferred` 挂出布局流、优先级压在最上面。
+            .when_some(Root::render_dialog_layer(window, cx), |this, layer| {
+                this.child(deferred(layer).with_priority(3))
+            })
     }
 }
 
@@ -3570,7 +4346,6 @@ impl Render for Workspace {
 enum TreeCommand {
     NewFile,
     NewFolder,
-    Open,
     CopyPath,
     Reveal,
     Rename,
@@ -3582,15 +4357,6 @@ impl TreeCommand {
         match self {
             Self::NewFile => workspace.create_in(&path, true, window, cx),
             Self::NewFolder => workspace.create_in(&path, false, window, cx),
-            Self::Open => {
-                if path.is_dir() {
-                    workspace.tree.toggle(&path);
-                    workspace.invalidate_tree();
-                    cx.notify();
-                } else {
-                    workspace.open(path, window, cx);
-                }
-            },
             Self::CopyPath => {
                 let shown = shell::friendly_path(&path);
                 cx.write_to_clipboard(ClipboardItem::new_string(shown.clone()));
@@ -3835,30 +4601,27 @@ fn unique_child(dir: &Path, base: &str, ext: &str) -> String {
 
 /// 标签右键菜单里的命令。
 ///
-/// 用一个 `Copy` 的小枚举而不是给每个条目各写一个闭包：菜单构建处要生成六条
+/// 用一个 `Copy` 的小枚举而不是给每个条目各写一个闭包：菜单构建处要生成几条
 /// 命令，逐个手写捕获会让那段代码膨胀成一个闭包墙，且每条都要重复一次
 /// "weak → upgrade → update" 的样板。这里把"哪条命令"与"怎么执行"分开。
+///
+/// 三个"关闭"条目（关闭此 / 其它 / 右侧标签）已按用户要求去掉：标签上的 `×` 与
+/// `Ctrl+W` 已经能关标签，菜单里再列三条是重复。
 #[derive(Clone, Copy)]
 enum TabCommand {
     TogglePin,
-    Close,
-    CloseOthers,
-    CloseToRight,
     CopyPath,
     Reveal,
     OpenExternally,
 }
 
 impl TabCommand {
-    fn run(self, workspace: &mut Workspace, index: usize, window: &mut Window, cx: &mut Context<Workspace>) {
+    fn run(self, workspace: &mut Workspace, index: usize, _window: &mut Window, cx: &mut Context<Workspace>) {
         let Some(path) = workspace.tabs.get(index).map(|doc| doc.path.clone()) else {
             return;
         };
         match self {
             Self::TogglePin => workspace.toggle_pin(index, cx),
-            Self::Close => workspace.close_tab(index, window, cx),
-            Self::CloseOthers => workspace.close_other_tabs(index, window, cx),
-            Self::CloseToRight => workspace.close_tabs_to_right(index, window, cx),
             Self::CopyPath => {
                 let shown = shell::friendly_path(&path);
                 // 剪贴板里给"人用的"形式（去掉 `\\?\`）：粘进对话框、终端、聊天
@@ -3950,6 +4713,90 @@ fn image_dimensions(image: &Arc<RenderImage>) -> Option<(u32, u32)> {
         .then(|| (size.width.0 as u32, size.height.0 as u32))
 }
 
+/// SVG 预览位图的目标最大边长（设备像素）。
+///
+/// `SvgRenderer::render_single_frame` 内部还会再乘一份 2× 的超采样，所以调用侧
+/// 按 `目标 / 2 / SVG 原尺寸` 算缩放系数，避免一张 4K 画布直接产出一张上亿像素
+/// 的位图（gpui 自己的上限是 8192²，仍然要 268 MB）。
+const SVG_PREVIEW_MAX_PX: f32 = 2048.0;
+
+/// 把 SVG 源码按**当前编辑缓冲**光栅化进 `Document::image`。
+///
+/// 缓存用 `text_rev` 判新旧：预览可见时切标签 / 切面只会在内容真的变过之后
+/// 重新渲染。渲染失败（语法错误、尺寸非法）让 `image` 保持 `None`，预览面显示
+/// "SVG 无法渲染"，而不是整个预览崩掉。
+fn refresh_svg_preview(doc: &mut Document, cx: &mut Context<Workspace>) {
+    if doc.kind != FileKind::Svg || (doc.svg_rev == doc.text_rev && doc.image.is_some()) {
+        return;
+    }
+    let text = doc.input.read(cx).value();
+    let scale = svg_intrinsic_max_dimension(&text)
+        .map(|dimension| (SVG_PREVIEW_MAX_PX / 2.0 / dimension).clamp(0.0001, 8.0))
+        .unwrap_or(1.0);
+    doc.image = cx.svg_renderer().render_single_frame(text.as_bytes(), scale).ok();
+    doc.image_geometry.reset(doc.image.as_ref().and_then(image_dimensions));
+    doc.svg_rev = doc.text_rev;
+}
+
+/// SVG 的内在尺寸里较大的那个边长（像素）。优先 `width` / `height`，其次 `viewBox`。
+///
+/// 只用于给光栅化挑一个合理的缩放系数，不追求完整的 XML / 单位解析：解析不出
+/// 就返回 `None`，调用侧按 1× 渲染，仍能出图。
+fn svg_intrinsic_max_dimension(source: &str) -> Option<f32> {
+    let start = source.find("<svg")?;
+    let tag = source[start..].split_once('>')?.0;
+    let width = svg_attr(tag, "width").and_then(parse_svg_px);
+    let height = svg_attr(tag, "height").and_then(parse_svg_px);
+    if let (Some(width), Some(height)) = (width, height) {
+        return Some(width.max(height));
+    }
+    let view_box = svg_attr(tag, "viewBox")?;
+    let values: Vec<f32> = view_box
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    let (width, height) = (values.get(2).copied()?, values.get(3).copied()?);
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some(width.max(height))
+}
+
+/// 读一个 SVG 起始标签里的属性值（支持单双引号）。
+fn svg_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(offset) = tag[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let boundary_before = start == 0
+            || !matches!(tag.as_bytes()[start - 1], b'-' | b':' | b'_')
+                && !tag.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let rest = tag[end..].trim_start();
+        if boundary_before
+            && let Some(rest) = rest.strip_prefix('=')
+        {
+            let value = rest.trim_start();
+            if let Some(quote @ (b'"' | b'\'')) = value.as_bytes().first().copied()
+                && let Some(close) = value[1..].find(quote as char)
+            {
+                return Some(&value[1..1 + close]);
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+/// SVG 长度里只认裸数字与 `px`；百分比、`mm` 等交给 `viewBox` 兜底。
+fn parse_svg_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let number = value
+        .strip_suffix("px")
+        .or_else(|| value.strip_suffix("PX"))
+        .unwrap_or(value);
+    let number: f32 = number.trim().parse().ok()?;
+    (number.is_finite() && number > 0.0).then_some(number)
+}
+
 /// 关掉 `closed` 之后新的激活下标，`new_len` 是关闭之后的标签数（>0）。
 ///
 /// 三条分支覆盖三种情况：关掉激活项左边的一个（激活项整体左移一格，仍指向原来
@@ -3982,6 +4829,63 @@ fn clamp_sidebar_width(saved: f32) -> f32 {
     } else {
         SIDEBAR_WIDTH
     }
+}
+
+/// 会话里存的大纲面板宽度夹回合法区间；`0.0`（没存过）与 NaN 都回落默认宽度。
+/// 与 [`clamp_sidebar_width`] 同一个道理：这份宽度跨显示器、跨缩放比长期存在，
+/// 也可能被手改，不夹的话面板能把正文挤成 0 宽。
+fn clamp_outline_width(saved: f32) -> f32 {
+    if saved.is_finite() && saved > 0.0 {
+        saved.clamp(MIN_OUTLINE_WIDTH, MAX_OUTLINE_WIDTH)
+    } else {
+        OUTLINE_WIDTH
+    }
+}
+
+/// 字号倍率 `scale` 下的编辑器 / 预览字号（取整，免得状态栏显示 `9.75px` 这种值）。
+fn scaled_font_size(scale: f32) -> f32 {
+    (DEFAULT_FONT_SIZE * scale).round()
+}
+
+/// 把任意来源的倍率夹进数轴区间（75%–125%）。
+///
+/// 设置文件可能被手改成任意数；现在字号是连续的数轴，不再吸附到三档，所以这里
+/// 只夹区间。非数回落中号。
+fn clamp_font_scale(saved: f32) -> f32 {
+    if !saved.is_finite() {
+        return FONT_SCALE_MEDIUM;
+    }
+    saved.clamp(FONT_SCALE_SMALL, FONT_SCALE_LARGE)
+}
+
+/// 这个文档当前该显示预览面吗（纯函数，好测）。
+///
+/// 预览 / 大纲是**运行期视图模式**（`Workspace::view_preview`）：切到别的文件依然
+/// 保持，重启回默认（源码）。Markdown / HTML / SVG 都跟随它。图片是唯一的例外——
+/// 它的字符面是有损解码出来的乱码，没有阅读价值，所以它自带一面一态
+/// （`Document::preview`，打开时是预览面，用户切到源码面也只是这一次的事）。
+fn shows_preview(kind: FileKind, image_preview: bool, view_preview: bool) -> bool {
+    if !kind.has_preview() {
+        false
+    } else if kind == FileKind::Image {
+        image_preview
+    } else {
+        view_preview
+    }
+}
+
+/// 设置面板里某个字体列表这一帧要显示的候选名：按顶置顺序排好、按过滤词筛过。
+///
+/// 直接给出 owned 的 `Vec<String>`，因为 `uniform_list` 的行构建闭包是 `'static` 的
+/// ——它不能借用目录里的 `&str`，所以这里把要显示的那一批名字拷一份。筛选在**每帧
+/// 每列表一次**（几百个短字符串的比较），比"每行各筛一遍"便宜，也不值得为它再引入
+/// 一份缓存状态。
+fn font_choices(catalog: &[String], pins: &[String], query: &str) -> Vec<String> {
+    crate::settings::ordered(catalog, pins)
+        .into_iter()
+        .filter(|name| query.is_empty() || name.to_lowercase().contains(query))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// 重算括号匹配并写进 `Document::brace_matches`。编辑器光标一动就被观察回调调用。
@@ -4311,5 +5215,78 @@ mod tests {
         assert_eq!(clamp_sidebar_width(200.0), 200.0);
         assert_eq!(clamp_sidebar_width(1.0), MIN_SIDEBAR_WIDTH);
         assert_eq!(clamp_sidebar_width(9999.0), MAX_SIDEBAR_WIDTH);
+    }
+
+    /// 会话里存的大纲面板宽度：正常值夹进区间，`0` / 负数 / NaN 回落默认宽度。
+    #[test]
+    fn session_outline_width_is_clamped_or_defaulted() {
+        assert_eq!(clamp_outline_width(0.0), OUTLINE_WIDTH, "没存过 → 默认宽度");
+        assert_eq!(clamp_outline_width(f32::NAN), OUTLINE_WIDTH);
+        assert_eq!(clamp_outline_width(-1.0), OUTLINE_WIDTH);
+        assert_eq!(clamp_outline_width(200.0), 200.0);
+        assert_eq!(clamp_outline_width(1.0), MIN_OUTLINE_WIDTH);
+        assert_eq!(clamp_outline_width(9999.0), MAX_OUTLINE_WIDTH);
+    }
+
+    /// 字号倍率：三个基准点各自算出的字号，以及"连续倍率只夹区间、不吸附"。
+    #[test]
+    fn font_scale_clamps_to_the_slider_range_and_maps_to_pixels() {
+        // 中号 = 默认的 13px；小号 / 大号按 75% / 125% 取整。
+        assert_eq!(scaled_font_size(FONT_SCALE_MEDIUM), DEFAULT_FONT_SIZE);
+        assert_eq!(scaled_font_size(FONT_SCALE_SMALL), 10.0);
+        assert_eq!(scaled_font_size(FONT_SCALE_LARGE), 16.0);
+
+        // 连续数轴：区间内的值原样保留，区间外夹到端点。
+        assert_eq!(clamp_font_scale(1.0), FONT_SCALE_MEDIUM);
+        assert_eq!(clamp_font_scale(0.9), 0.9, "数轴上的中间值不该被吸附");
+        assert_eq!(clamp_font_scale(1.13), 1.13);
+        assert_eq!(clamp_font_scale(0.4), FONT_SCALE_SMALL);
+        assert_eq!(clamp_font_scale(7.0), FONT_SCALE_LARGE);
+        assert_eq!(clamp_font_scale(f32::NAN), FONT_SCALE_MEDIUM, "非数回落中号");
+    }
+
+    /// 视图模式对一切"有预览面"的类型生效，图片例外（它自带一面一态）。
+    #[test]
+    fn preview_face_follows_the_run_time_mode_except_for_images() {
+        // Markdown / HTML / SVG：完全听运行期视图模式的。
+        for kind in [FileKind::Markdown, FileKind::Html, FileKind::Svg] {
+            assert!(shows_preview(kind, false, true), "{kind:?}");
+            assert!(!shows_preview(kind, true, false), "{kind:?}");
+        }
+        // 图片：听它自己那一面，与视图模式无关。
+        assert!(shows_preview(FileKind::Image, true, false));
+        assert!(!shows_preview(FileKind::Image, false, true));
+        // 没有预览面的类型（纯文本）永远是源码面。
+        assert!(!shows_preview(FileKind::Text, true, true));
+    }
+
+    /// SVG 的内在尺寸优先读 width / height，其次 viewBox；都不行就交给 1× 兜底。
+    #[test]
+    fn svg_intrinsic_size_prefers_attributes_then_view_box() {
+        assert_eq!(
+            svg_intrinsic_max_dimension(r#"<svg width="400" height="200" viewBox="0 0 10 10">"#),
+            Some(400.0)
+        );
+        assert_eq!(
+            svg_intrinsic_max_dimension(r#"<svg width="100%" viewBox="0 0 24 96">"#),
+            Some(96.0)
+        );
+        assert_eq!(
+            svg_intrinsic_max_dimension("<svg viewBox='0,0,120,80'>"),
+            Some(120.0)
+        );
+        // `stroke-width` 不能被当成 `width`。
+        assert_eq!(svg_intrinsic_max_dimension(r#"<svg stroke-width="8">"#), None);
+        assert_eq!(svg_intrinsic_max_dimension("not an svg"), None);
+    }
+
+    /// HTML 预览去掉 head（title 不该出现在正文顶部）；没有 head 的片段原样保留。
+    #[test]
+    fn html_preview_drops_the_head_section() {
+        let html = "<!DOCTYPE html><HTML><HEAD><title>Demo</title></HEAD><body>Hi</body></HTML>";
+        let preview = html_preview_source(html);
+        assert!(!preview.contains("Demo"), "{preview}");
+        assert!(preview.contains("<body>Hi</body>"), "{preview}");
+        assert_eq!(html_preview_source("<p>Hi</p>"), "<p>Hi</p>");
     }
 }

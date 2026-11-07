@@ -12,11 +12,13 @@
 //! **编辑器里的代码配色与这里无关**：那部分照 Notepad3 的默认浅色方案、按语言
 //! 取自它的 `styleLex*.c`，见本节「代码配色」与 `crate::syntax`。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{App, Hsla, Pixels, Rgba, px};
 use gpui_component::Theme;
-use gpui_component::highlighter::SyntaxColors;
+use gpui_component::highlighter::{HighlightTheme, SyntaxColors};
 
 /// 不透明墨色/语义色的字面量。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +340,61 @@ pub fn notepad3_highlight_theme(
     highlighted
 }
 
+/// 把围栏里的语言名归一到组件库注册表 / Notepad3 调色板使用的名字。
+///
+/// Markdown 的围栏可以写任意别名（`py` / `js` / `c++`…），而高亮器只认注册表
+/// 里的名字。未收录的名字原样返回：高亮器会回落纯文本、调色板也会给正文黑，
+/// 不会报错。`None` / 空串按纯文本处理。
+fn canonical_code_language(language: Option<&str>) -> String {
+    let Some(language) = language else {
+        return "text".to_owned();
+    };
+    let name = language.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "" | "plain" | "plaintext" | "txt" | "text" => "text".to_owned(),
+        "py" | "python3" => "python".to_owned(),
+        "js" | "mjs" | "cjs" | "node" => "javascript".to_owned(),
+        "ts" => "typescript".to_owned(),
+        "rs" => "rust".to_owned(),
+        "c++" | "cc" | "cxx" | "hpp" => "cpp".to_owned(),
+        "c#" | "cs" => "csharp".to_owned(),
+        "sh" | "shell" | "zsh" | "console" => "bash".to_owned(),
+        "ps1" | "pwsh" => "powershell".to_owned(),
+        "bat" => "batch".to_owned(),
+        "yml" => "yaml".to_owned(),
+        "md" => "markdown".to_owned(),
+        "htm" => "html".to_owned(),
+        "golang" => "go".to_owned(),
+        "rb" => "ruby".to_owned(),
+        "kt" | "kts" => "kotlin".to_owned(),
+        _ => name,
+    }
+}
+
+thread_local! {
+    /// 每个围栏语言一份高亮主题。`recolor_syntax` 要走一次 JSON 序列化，
+    /// 每个代码块每帧重建太浪费；语言集合很小，进程内缓存即可。
+    static CODE_BLOCK_THEMES: RefCell<HashMap<String, Arc<HighlightTheme>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 预览里某个围栏代码块的高亮主题：按**围栏语言**取 Notepad3 那张配色表。
+///
+/// 组件库的 `CodeBlock` 默认读全局高亮主题（= 当前文档语言那份，见
+/// `install_syntax_theme`），所以从前 ```python 的代码块套的是 Markdown 的
+/// 配色。`TextViewStyle::code_block_theme` 这个钩子把"按语言挑主题"交给这里。
+pub fn code_block_highlight_theme(language: Option<&str>) -> Arc<HighlightTheme> {
+    crate::languages::ensure_registered();
+    let language = canonical_code_language(language);
+    CODE_BLOCK_THEMES.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(language.clone())
+            .or_insert_with(|| Arc::new(notepad3_highlight_theme(&language, false)))
+            .clone()
+    })
+}
+
 /// 给当前文档的语言装入对应的高亮主题。
 ///
 /// 组件库的高亮主题是**一张全局表**（`Theme::highlight_theme`），渲染时按
@@ -357,8 +414,13 @@ pub fn install_syntax_theme(cx: &mut App, language: &str, current_line: bool) {
 const RADIUS: Pixels = px(6.0);
 /// 面板圆角（对话框 / 卡片 / 通知）。macOS 的面板在这一档。
 const RADIUS_LG: Pixels = px(10.0);
-/// 界面字号，对应 Pebrel 的默认 `ui_font_size`。
-const UI_FONT_SIZE: Pixels = px(14.0);
+/// 界面字号（中号档位下的值），对应 Pebrel 的默认 `ui_font_size`。
+///
+/// 它是 `Theme::font_size` 的初值，也就是窗口的 **rem 基准**
+/// （`Root::render` 每帧 `set_rem_size(theme.font_size)`），界面上所有 `text_xs` /
+/// `text_sm` 都由它算出。设置面板里的字号档位（小号 75% / 中号 100% / 大号 125%）
+/// 拿它当 100%，所以 `app.rs` 要按倍率改 `Theme::font_size`——这里必须公开。
+pub const UI_FONT_SIZE: Pixels = px(14.0);
 /// 等宽字号相对界面字号的比值（沿用 Pebrel 的 13/14）。
 ///
 /// `app.rs` 改字号时必须拿它同步 `Theme::mono_font_size`：Markdown 预览里的代码块
@@ -612,5 +674,31 @@ mod tests {
             a: 36.0 / 255.0,
         };
         assert_eq!(select, Hsla::from(blue));
+    }
+
+    /// 围栏语言的别名要落到注册表 / 调色板认得的名字；认不出的原样保留。
+    #[test]
+    fn fence_language_aliases_are_canonicalized() {
+        assert_eq!(canonical_code_language(Some("py")), "python");
+        assert_eq!(canonical_code_language(Some("JS")), "javascript");
+        assert_eq!(canonical_code_language(Some("c++")), "cpp");
+        assert_eq!(canonical_code_language(Some("rs")), "rust");
+        assert_eq!(canonical_code_language(Some("C#")), "csharp");
+        assert_eq!(canonical_code_language(Some("yml")), "yaml");
+        assert_eq!(canonical_code_language(Some("sh")), "bash");
+        assert_eq!(canonical_code_language(Some("  ")), "text");
+        assert_eq!(canonical_code_language(None), "text");
+        assert_eq!(canonical_code_language(Some("unknown-lang")), "unknown-lang");
+    }
+
+    /// 预览代码块的配色跟随**围栏语言**，而不是当前文档语言。
+    #[test]
+    fn code_block_theme_follows_the_fence_language() {
+        let python = code_block_highlight_theme(Some("py"));
+        let rust = code_block_highlight_theme(Some("rs"));
+        assert_eq!(value(&python.style.syntax, "keyword")["color"], "#00007fff");
+        assert_eq!(value(&rust.style.syntax, "keyword")["color"], "#248112ff");
+        // 同一个语言取两次必须是同一份缓存（每个代码块每帧重建太浪费）。
+        assert!(Arc::ptr_eq(&python, &code_block_highlight_theme(Some("python"))));
     }
 }

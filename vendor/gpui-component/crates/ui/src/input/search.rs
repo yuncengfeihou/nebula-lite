@@ -3,21 +3,20 @@ use rust_i18n::t;
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled, Subscription,
-    Window, actions, div, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled, Subscription,
+    Window, actions, div, prelude::FluentBuilder as _, px,
 };
 use ropey::Rope;
 
 use crate::{
-    ActiveTheme, Disableable, ElementExt, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     input::{
         Enter, Escape, IndentInline, Input, InputEvent, InputState, OutdentInline, Replace,
         RopeExt as _, Search, movement::MoveDirection,
     },
-    label::Label,
     v_flex,
 };
 
@@ -176,7 +175,6 @@ pub(super) struct SearchPanel {
     case_insensitive: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
-    input_width: Pixels,
 
     open: bool,
     _subscriptions: Vec<Subscription>,
@@ -188,6 +186,16 @@ impl InputState {
         let Some(search_panel) = self.search_panel.as_ref() else {
             return;
         };
+
+        // ───── nebula-lite 本地补丁：面板关着时不要重扫全文 ─────
+        // 上游每次缓冲变更都调 `SearchMatcher::update`：整条 rope → String 拷贝一次，
+        // 再用 Aho-Corasick 扫一遍。面板关着时 `matcher()` 返回 None（匹配区间既不
+        // 绘制也不参与交互），这次扫描纯属白烧——4.8 MB 的 .txt 上实测每键
+        // 3 ms → 21 ms。`open_search_panel` 重新打开时本来就会 `matcher.update(&text)`，
+        // 所以跳过不会让结果变旧。
+        if search_panel.read(cx).matcher().is_none() {
+            return;
+        }
 
         let text = self.text.clone();
         search_panel.update(cx, |this, _| {
@@ -312,7 +320,6 @@ impl SearchPanel {
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
-                input_width: Pixels::ZERO,
                 _subscriptions,
             }
         })
@@ -570,6 +577,23 @@ impl Render for SearchPanel {
             self.replace_mode = false;
         }
 
+        // ───── nebula-lite 本地补丁：查找面板的版式 ─────
+        //
+        // 上游把右侧动作平铺在一行里：替换开关用 `selected` 的实心选中样式
+        // （浅色主题下是一颗显眼的蓝色圆点）、计数用 `min_w_16` 撑开、关闭
+        // 按钮前还有一个固定 28px 的空白占位，替换行又按搜索框的实测宽度
+        // 排版——两行的右缘对不齐，看上去"散"。
+        //
+        // 这里把两行收进同一套栅格：第一行 = 搜索框 +（替换开关 / 上一下一 /
+        // 计数）+ 分隔线 + 关闭；第二行 = 替换框 + 两个替换按钮。两行的右缘
+        // 都落在面板内边距上，计数固定 48px 宽（数字跳动时控件不位移），
+        // 替换开关用淡淡的蓝色水洗表示"开着"，而不是实心圆点。
+        let band = cx.theme().muted;
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().primary;
+        let accent_soft = cx.theme().tab_active;
+
         v_flex()
             .id("search-panel")
             .occlude()
@@ -581,100 +605,105 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_tab_prev))
             .on_action(cx.listener(Self::on_action_replace))
             .font_family(cx.theme().font_family.clone())
-            .items_center()
-            .py_2()
-            .px_3()
             .w_full()
-            .gap_1()
-            .bg(cx.theme().tokens.popover)
+            .px(px(10.0))
+            .py(px(8.0))
+            .gap(px(6.0))
+            .bg(band)
             .border_b_1()
-            .rounded(cx.theme().radius.half())
-            .border_color(cx.theme().border)
+            .border_color(border)
             .child(
                 h_flex()
                     .w_full()
-                    .gap_2()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(8.0))
                     .child(
-                        div()
-                            .flex()
+                        h_flex()
                             .flex_1()
-                            .gap_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(4.0))
                             .child(
-                                Input::new(&self.search_input)
-                                    .focus_bordered(false)
-                                    .suffix(
-                                        Button::new("case-insensitive")
-                                            .selected(!self.case_insensitive)
-                                            .toggled(!self.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .text()
-                                            .icon(IconName::CaseSensitive)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.case_insensitive = !this.case_insensitive;
-                                                let visible_range_offset = this
-                                                    .editor
-                                                    .read(cx)
-                                                    .last_layout
-                                                    .as_ref()
-                                                    .map(|l| l.visible_range_offset.clone());
-                                                this.update_search_query(visible_range_offset, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .small()
-                                    .w_full()
-                                    .shadow_none(),
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&self.search_input)
+                                        .focus_bordered(false)
+                                        .suffix(
+                                            Button::new("case-insensitive")
+                                                .toggled(!self.case_insensitive)
+                                                .xsmall()
+                                                .compact()
+                                                .text()
+                                                .icon(IconName::CaseSensitive)
+                                                .when(!self.case_insensitive, |this| {
+                                                    this.bg(accent_soft).text_color(accent)
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.case_insensitive = !this.case_insensitive;
+                                                    let visible_range_offset = this
+                                                        .editor
+                                                        .read(cx)
+                                                        .last_layout
+                                                        .as_ref()
+                                                        .map(|l| l.visible_range_offset.clone());
+                                                    this.update_search_query(
+                                                        visible_range_offset,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .small()
+                                        .w_full()
+                                        .shadow_none(),
+                                ),
                             )
-                            .on_prepaint({
-                                let view = cx.entity();
-                                move |bounds, _, cx| {
-                                    view.update(cx, |r, _| r.input_width = bounds.size.width)
-                                }
-                            }),
-                    )
-                    .when(allow_replace, |this| {
-                        this.child(
-                            Button::new("replace-mode")
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::Replace)
-                                .selected(self.replace_mode)
-                                .toggled(self.replace_mode)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_replace_mode(window, cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("prev")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.prev(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("next")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.next(window, cx);
-                            })),
-                    )
-                    .child(
-                        Label::new(self.matcher.label())
-                            .when(!has_matches, |this| {
-                                this.text_color(cx.theme().muted_foreground)
+                            .when(allow_replace, |this| {
+                                this.child(
+                                    Button::new("replace-mode")
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(IconName::Replace)
+                                        .toggled(self.replace_mode)
+                                        .when(self.replace_mode, |this| {
+                                            this.bg(accent_soft).text_color(accent)
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_replace_mode(window, cx);
+                                        })),
+                                )
                             })
-                            .text_left()
-                            .min_w_16(),
+                            .child(
+                                Button::new("prev")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(IconName::ChevronLeft)
+                                    .disabled(!has_matches)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.prev(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("next")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(IconName::ChevronRight)
+                                    .disabled(!has_matches)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.next(window, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .w(px(48.0))
+                                    .flex_shrink_0()
+                                    .text_center()
+                                    .text_sm()
+                                    .text_color(if has_matches { accent } else { muted })
+                                    .child(self.matcher.label()),
+                            ),
                     )
-                    .child(div().w_7())
+                    .child(div().w(px(1.0)).h(px(16.0)).flex_shrink_0().bg(border))
                     .child(
                         Button::new("close")
                             .xsmall()
@@ -689,13 +718,17 @@ impl Render for SearchPanel {
                 this.child(
                     h_flex()
                         .w_full()
-                        .gap_2()
+                        .min_w_0()
+                        .items_center()
+                        .gap(px(8.0))
                         .child(
-                            Input::new(&self.replace_input)
-                                .focus_bordered(false)
-                                .small()
-                                .w(self.input_width)
-                                .shadow_none(),
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.replace_input)
+                                    .focus_bordered(false)
+                                    .small()
+                                    .w_full()
+                                    .shadow_none(),
+                            ),
                         )
                         .child(
                             Button::new("replace-one")

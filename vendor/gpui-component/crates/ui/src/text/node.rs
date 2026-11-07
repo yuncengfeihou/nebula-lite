@@ -7,7 +7,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, DefiniteLength, Div, ElementId, FontStyle, FontWeight, Half, HighlightStyle,
-    Hsla, InteractiveElement as _, IntoElement, Length, ObjectFit, Overflow, ParentElement,
+    Hsla, InteractiveElement as _, IntoElement, ObjectFit, Overflow, ParentElement,
     ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
     WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
@@ -1151,6 +1151,15 @@ impl CodeBlock {
         self.lang.clone()
     }
 
+    /// Stable identity of this block inside its document.
+    ///
+    /// nebula-lite 本地补丁：预览的复制按钮要按代码块记住"刚复制过"的
+    /// 状态，需要一份跨帧稳定的键。源码位置（`span.start`）由 Markdown
+    /// 解析器给出，同一次解析里唯一。
+    pub fn key(&self) -> usize {
+        self.span.map(|span| span.start).unwrap_or(usize::MAX)
+    }
+
     /// Get the code content of the code block.
     pub fn code(&self) -> SharedString {
         self.state
@@ -1298,6 +1307,65 @@ impl CodeBlock {
     ) -> AnyElement {
         let style = &node_cx.style;
 
+        // ───── nebula-lite 本地补丁：树状图代码块的行距 ─────
+        //
+        // 用户反馈 Markdown 里的文件树"行与行太挤"。此前这里把含制表符
+        // （U+2500–U+257F）的代码块压到 1.45 倍，比正文（1.618 倍）还紧，
+        // 反而更难受；现在改为 1.75 倍，让树状图的每一行都有明显的呼吸
+        // 空间。竖线（`│`）在等宽字体里只画满一个 em，行距拉大后会在行与
+        // 行之间留一点缺口——这是等宽字体 + 大行距的固有取舍，用户明确
+        // 选择了"行距优先"。普通代码块不受影响。
+        // 判断放在渲染期（这里）而不是解析期，是因为 `TextView` 的代码块节点
+        // 不携带"要不要紧行距"的样式位。
+        let box_drawing = self
+            .code()
+            .chars()
+            .any(|c| ('\u{2500}'..='\u{257F}').contains(&c));
+        // ───── nebula-lite 本地补丁结束 ─────
+
+        let lang = self.lang.clone().filter(|lang| !lang.trim().is_empty());
+        // 按围栏语言挑高亮主题（`TextViewStyle::code_block_theme` 由调用方提供）；
+        // 没提供时沿用全局主题，与上游行为一致。
+        let highlight_theme = match node_cx.style.code_block_theme.as_ref() {
+            Some(theme_for) => theme_for(lang.as_deref()),
+            None => cx.theme().highlight_theme.clone(),
+        };
+        let actions = node_cx.code_block_actions.clone();
+        // ───── nebula-lite 本地补丁：语言名 + 复制按钮的头部 ─────
+        //
+        // 围栏标了语言时左上角显示语言名；调用方提供 `code_block_actions`
+        // 时右上角放它返回的元素（本应用放复制按钮）。没有语言名但有操作
+        // 按钮时左侧显示 `text`——留一条空白的头反而像布局出错。
+        let label = lang
+            .clone()
+            .or_else(|| actions.is_some().then(|| SharedString::from("text")));
+        let header = (label.is_some() || actions.is_some()).then(|| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(6.0))
+                // 头部与正文之间不画横线：两者同底同色，靠内边距区分即可。
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        // 吃 rem 基准而不是写死 11px：设置面板放大字号时
+                        // 语言名跟着一起放大。
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().muted_foreground)
+                        .when_some(label, |this, label| this.child(label)),
+                )
+                .when_some(actions.clone(), |this, actions| {
+                    this.child(div().flex_shrink_0().child(actions(self, window, cx)))
+                })
+        });
+        let has_header = header.is_some();
+        // ───── nebula-lite 本地补丁结束 ─────
+
         div()
             .w_full()
             .min_w_0()
@@ -1307,32 +1375,31 @@ impl CodeBlock {
                     .id(("codeblock", options.ix))
                     .w_full()
                     .min_w_0()
-                    .p_3()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().tokens.muted)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .relative()
+                    .overflow_hidden()
                     .refine_style(&style.code_block)
-                    .child(Inline::new(
-                        "code",
-                        self.state.clone(),
-                        vec![],
-                        self.styles(&cx.theme().highlight_theme),
-                        node_cx.link_click_handler.clone(),
-                    ))
-                    .when_some(node_cx.code_block_actions.clone(), |this, actions| {
-                        this.child(
-                            div()
-                                .id("actions")
-                                .absolute()
-                                .top_2()
-                                .right_2()
-                                .bg(cx.theme().tokens.muted)
-                                .rounded(cx.theme().radius)
-                                .child(actions(&self, window, cx)),
-                        )
-                    }),
+                    .when_some(header, |this, header| this.child(header))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .when(has_header, |this| {
+                                this.px(px(12.0)).pt(px(8.0)).pb(px(12.0))
+                            })
+                            .when(!has_header, |this| this.p(px(12.0)))
+                            .when(box_drawing, |this| this.line_height(relative(1.75)))
+                            .child(Inline::new(
+                                "code",
+                                self.state.clone(),
+                                vec![],
+                                self.styles(&highlight_theme),
+                                node_cx.link_click_handler.clone(),
+                            )),
+                    ),
             )
             .into_any_element()
     }
@@ -2299,7 +2366,49 @@ impl BlockNode {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        const MAX_LENGTH: usize = 150;
+        // 上游的 `MAX_LENGTH`（每列最多按 150 个字符算权重）随字符数权重一起
+        // 被 nebula-lite 补丁取代：列宽现在按实测文本宽度分配。
+
+        // ───── nebula-lite 本地补丁：列宽按**实测文本宽度**分配 ─────
+        //
+        // 上游用 `cell.children.text_len()`（字符数）当列宽权重。字符数不等于
+        // 显示宽度：一个 CJK 字占两列、一个拉丁字母占一列，于是"中文为主的列"
+        // 拿到的权重只有它实际需要的一半——列被压得过窄，格子里的话被硬挤成
+        // 一列一两个字（`ctx.tools.register` 那种还会被从词中间掰断）。
+        //
+        // 这里改成与 `render_scroll_table` 同一套测宽：按每列最宽的单元格算
+        // max-content 像素宽，拿它当 flex-basis。行是 `w_full` + 各列
+        // `flex_shrink(1)`，所以总宽永远收进容器（不会横向溢出），缩的时候
+        // 按内容比例缩，文字自然在格子内换行。
+        let measured: Vec<f32> = {
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let measure = |s: &str| -> f32 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                let run = text_style.to_run(s.len());
+                f32::from(window.text_system().layout_line(s, font_size, &[run], None).width)
+            };
+            let mut widths = vec![0.0_f32; col_lens.len()];
+            for row in table.children.iter() {
+                for (ix, cell) in row.children.iter().enumerate() {
+                    let Some(slot) = widths.get_mut(ix) else {
+                        continue;
+                    };
+                    for line in cell.children.text().split('\n') {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        *slot = slot.max(measure(line));
+                    }
+                }
+            }
+            widths
+        };
+        // ───── nebula-lite 本地补丁结束 ─────
+
 
         let style = &node_cx.style;
         let row_count = table.children.len();
@@ -2309,11 +2418,23 @@ impl BlockNode {
             for (ix, cell) in row.children.iter().enumerate() {
                 let align = table.column_align(ix);
                 let is_last_col = ix == row.children.len() - 1;
-                let len = col_lens
-                    .get(ix)
-                    .copied()
-                    .unwrap_or(MAX_LENGTH)
-                    .min(MAX_LENGTH);
+                // 上游这里用 `col_lens[ix]` 当宽度权重；列宽已改成按实测像素宽
+                // （见下面的 nebula-lite 补丁），这个字符数不再参与排版。
+                let _ = col_lens;
+
+                // ───── nebula-lite 本地补丁：实测宽当 basis，可 shrink ─────
+                //
+                // `content_w` 是这一列的 max-content（最宽单元格的实测宽度）加
+                // 单元格内边距余量，拿它当 flex-basis。
+                //
+                // **不要**再给列设 `min_w` 下限。列的下限一旦存在，各列下限之和
+                // 就可能超过容器宽度——flex 缩不下去，整张表向右溢出、最后一列被
+                // 切在视口外（那正是用户报的"跑出表格外"）。去掉下限后，收缩完全
+                // 交给 `flex_shrink(1)`：总宽永远等于容器宽，按 basis 比例分配，
+                // 文字在格子内换行。中文列因此不会被压成竖条，英文长标识符也不会
+                // 溢出（`white_space: normal` 下 gpui 会在超宽处强制断开）。
+                let content_w = measured.get(ix).copied().unwrap_or(0.0) + 24.0;
+                // ───── nebula-lite 本地补丁结束 ─────
 
                 cells.push(
                     div()
@@ -2321,8 +2442,11 @@ impl BlockNode {
                         .overflow_hidden()
                         .when(align == ColumnumnAlign::Center, |this| this.text_center())
                         .when(align == ColumnumnAlign::Right, |this| this.text_right())
-                        .min_w_16()
-                        .w(Length::Definite(relative(len as f32)))
+                        // ───── nebula-lite 本地补丁：用像素 basis 而不是字符比例 ─────
+                        .flex_basis(px(content_w))
+                        .flex_grow(0.)
+                        .flex_shrink(1.)
+                        // ───── nebula-lite 本地补丁结束 ─────
                         .px_2()
                         .py_1()
                         .when(!is_last_col, |this| {
@@ -2443,6 +2567,13 @@ impl BlockNode {
                 .w_full()
                 .min_w_0()
                 .pb(mb)
+                // ───── nebula-lite 本地补丁：列表项之间的纵向呼吸 ─────
+                //
+                // 上游列表项之间没有间距，嵌套的"文件树式"列表看起来挤成
+                // 一片（用户反馈"行与行太挤"）。0.3rem 约 4px，行内文字行高
+                // 不变，只是项与项之间多一条窄空带。
+                .gap(rems(0.3))
+                // ───── nebula-lite 本地补丁结束 ─────
                 .children({
                     let mut items = Vec::with_capacity(children.len());
                     let mut item_index = 0;

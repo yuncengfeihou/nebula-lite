@@ -50,6 +50,65 @@ impl LineItem {
     }
 }
 
+/// 把一行文本折成 [`LineItem`]。
+///
+/// `wrap_width` 为 `None`（自动换行关着）时**不把行拷成 `String`**：那个拷贝只
+/// 为 `wrap_line` 测量宽度服务，纯文本文件整篇打开时是 89k 次白分配（4.8 MB 的
+/// .txt 实测 ~60 ms）。不折行时每行只需要"长度 + 一个整行区间"。
+fn wrap_line_item(
+    line: ropey::RopeSlice<'_>,
+    wrap_width: Option<Pixels>,
+    wrapping_indent: WrappingIndent,
+    wrap_line: &mut impl FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
+) -> LineItem {
+    let len = line.len();
+    let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
+    let mut indent_chars = 0;
+
+    // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
+    if let Some(wrap_width) = wrap_width {
+        let line_str = line.to_string();
+        let mut prev_boundary_ix = 0;
+
+        match wrapping_indent {
+            WrappingIndent::Same => {
+                // Here only have wrapped line, if there is no wrap meet, the `line_wraps`
+                // result will empty.
+                for boundary in wrap_line(&line_str, wrap_width) {
+                    wrapped_lines.push(prev_boundary_ix..boundary.ix);
+                    prev_boundary_ix = boundary.ix;
+                    indent_chars = boundary.next_indent;
+                }
+            }
+            WrappingIndent::None => {
+                // The first visual line keeps the line's leading indentation, so it is
+                // wrapped as is.
+                let bondaries = wrap_line(&line_str, wrap_width);
+                if let Some(first) = bondaries.first() {
+                    let first_ix = first.ix;
+                    wrapped_lines.push(prev_boundary_ix..first_ix);
+                    prev_boundary_ix = first_ix;
+
+                    for boundary in wrap_line(&line_str[first_ix..], wrap_width) {
+                        let ix = first_ix + boundary.ix;
+                        wrapped_lines.push(prev_boundary_ix..ix);
+                        prev_boundary_ix = ix;
+                    }
+                }
+            }
+        }
+
+        // Reset of the line
+        if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
+            wrapped_lines.push(prev_boundary_ix..len);
+        }
+    } else {
+        wrapped_lines.push(0..len);
+    }
+
+    LineItem { len, indent: indent_chars, wrapped_lines }
+}
+
 /// Summary of a subtree of [`LineItem`]s, maintained incrementally by the [`SumTree`].
 #[derive(Debug, Clone)]
 pub(crate) struct LineSummary {
@@ -160,6 +219,12 @@ impl TextWrapper {
             lines: SumTree::new(&()),
             _initialized: false,
         }
+    }
+
+    /// 当前**已经生效**的折行宽度（`None` = 不折行）。
+    #[inline]
+    pub(crate) fn wrap_width(&self) -> Option<Pixels> {
+        self.wrap_width
     }
 
     #[inline]
@@ -285,6 +350,10 @@ impl TextWrapper {
         new_text: &Rope,
         cx: &mut App,
     ) {
+        // 大范围重排（打开文件、改折行宽度）在这里是**同步**的：4.8 MB 文本约
+        // 200 ms。窗口拖动那一路已经由 `DisplayMap::on_layout_changed` 推迟到停手
+        // 之后合并做一次，所以这里不做并行——实测开 8 个线程反而更慢（文本系统
+        // 内部有锁，冷缓存时 201 ms → 387 ms，热缓存 182 ms → 292 ms）。
         let mut line_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
@@ -325,59 +394,31 @@ impl TextWrapper {
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
 
-        let mut new_lines = vec![];
         let wrap_width = self.wrap_width;
+        let wrapping_indent = self.wrapping_indent;
+        let mut new_lines = Vec::new();
 
         // line not contains `\n`.
         for line in Rope::from(changed_text.slice(new_range)).iter_lines() {
-            let line_str = line.to_string();
-            let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
-            let mut prev_boundary_ix = 0;
-            let mut indent_chars = 0;
-
-            // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
-            if let Some(wrap_width) = wrap_width {
-                match self.wrapping_indent {
-                    WrappingIndent::Same => {
-                        // Here only have wrapped line, if there is no wrap meet, the `line_wraps`
-                        // result will empty.
-                        for boundary in wrap_line(&line_str, wrap_width) {
-                            wrapped_lines.push(prev_boundary_ix..boundary.ix);
-                            prev_boundary_ix = boundary.ix;
-                            indent_chars = boundary.next_indent;
-                        }
-                    }
-                    WrappingIndent::None => {
-                        // The first visual line keeps the line's leading indentation, so it is
-                        // wrapped as is.
-                        let bondaries = wrap_line(&line_str, wrap_width);
-                        if let Some(first) = bondaries.first() {
-                            let first_ix = first.ix;
-                            wrapped_lines.push(prev_boundary_ix..first_ix);
-                            prev_boundary_ix = first_ix;
-
-                            for boundary in wrap_line(&line_str[first_ix..], wrap_width) {
-                                let ix = first_ix + boundary.ix;
-                                wrapped_lines.push(prev_boundary_ix..ix);
-                                prev_boundary_ix = ix;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reset of the line
-            if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
-                wrapped_lines.push(prev_boundary_ix..line.len());
-            }
-
-            new_lines.push(LineItem {
-                len: line.len(),
-                indent: indent_chars,
-                wrapped_lines,
-            });
+            new_lines.push(wrap_line_item(
+                line,
+                wrap_width,
+                wrapping_indent,
+                wrap_line,
+            ));
         }
 
+        self.splice_lines(start_row, end_row, new_lines, changed_text);
+    }
+
+    /// 把 `new_lines` 换进 `[start_row, end_row]` 这一段，并把文本指向新版本。
+    fn splice_lines(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        new_lines: Vec<LineItem>,
+        changed_text: &Rope,
+    ) {
         if self.lines.is_empty() {
             self.lines = SumTree::from_iter(new_lines, &());
         } else {
@@ -771,6 +812,47 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    /// 不折行时每行只要一个整行区间，而且**不该**调用 `wrap_line`（上游会为此把
+    /// 每行拷成 `String`，纯文本整篇打开时是几十万次白分配）。
+    #[test]
+    fn no_wrap_line_item_skips_measuring() {
+        let text = Rope::from("第一行\nsecond line\n\n最后一行");
+        let mut wrap_called = false;
+        let mut check = |line: ropey::RopeSlice<'_>, expected: Range<usize>| {
+            let item = wrap_line_item(line, None, WrappingIndent::Same, &mut |_, _| {
+                wrap_called = true;
+                vec![]
+            });
+            assert_eq!(item.len(), expected.len(), "行长");
+            assert_eq!(item.wrapped_lines.as_slice(), &[expected], "整行一个区间");
+            assert_eq!(item.indent, 0);
+        };
+
+        check(text.slice_line(0), 0..9);
+        check(text.slice_line(1), 0..11);
+        check(text.slice_line(2), 0..0);
+        check(text.slice_line(3), 0..12);
+        assert!(!wrap_called, "不折行时不该测量任何一行");
+    }
+
+    /// 折行开着时仍走原来的测量路径：没有断点就整行一段。
+    #[test]
+    fn wrapped_line_item_without_boundaries_is_one_row() {
+        let text = Rope::from("一行");
+        let mut calls = 0;
+        let item = wrap_line_item(
+            text.slice_line(0),
+            Some(px(100.)),
+            WrappingIndent::Same,
+            &mut |_, _| {
+                calls += 1;
+                vec![]
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(item.wrapped_lines.as_slice(), &[0..6]);
+    }
 
     #[test]
     fn test_update() {
