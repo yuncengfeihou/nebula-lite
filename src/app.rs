@@ -3278,7 +3278,12 @@ impl Workspace {
             .into_any_element()
     }
 
-/// 状态栏提示：截断 / 编码 / 只读 / 外部冲突，这些直接影响"能不能编辑"。
+    /// 状态栏提示：截断 / 只读 / 外部冲突，这些直接影响"能不能编辑"。
+    ///
+    /// **不报当前编码**：GB18030 之类的文件每打开一次就常驻一行"编码 GB18030
+    /// （保存按原编码写回）"，对天天看同一个文件的人是纯噪音（用户明确要求去掉）。
+    /// 保存按原编码写回是既定行为，不需要每次提醒；真正需要打断用户的只有下面
+    /// 这几种"你不能按预期编辑 / 保存"的状态。
     fn status_note(&self) -> Option<String> {
         let doc = self.active_doc()?;
         let mut notes = Vec::new();
@@ -3293,9 +3298,6 @@ impl Workspace {
         }
         if doc.snapshot.invalid_encoding {
             notes.push(String::from("无法识别编码（按有损方式显示）"));
-        } else if doc.snapshot.encoding != text_file::Encoding::Utf8 {
-            // 非 UTF-8 的文件要让用户知道两件事：这是什么编码、以及保存不会把它改掉。
-            notes.push(format!("编码 {}（保存按原编码写回）", doc.snapshot.encoding.label()));
         }
         if doc.snapshot.read_only && !doc.snapshot.truncated && !doc.snapshot.invalid_encoding {
             notes.push(String::from("文件系统标记为只读"));

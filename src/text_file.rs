@@ -36,7 +36,13 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    /// 状态栏里显示的名字。
+    /// 调试 / 诊断用的名字。
+    ///
+    /// 状态栏**不再**显示当前编码（用户要求去掉：常驻一行"编码 GB18030（保存按
+    /// 原编码写回）"对天天看同一个文件的人是噪音），所以这里暂时没有渲染侧调用点。
+    /// 保留它是为了让 `stderr` 诊断与将来的"文件信息"面板有一份统一的名字，而不是
+    /// 各自 `match` 一遍。
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Utf8 => "UTF-8",
